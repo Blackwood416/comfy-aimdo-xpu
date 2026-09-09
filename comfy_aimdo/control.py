@@ -93,6 +93,8 @@ def _native_log(level, message):
 
 def detect_vendor():
     version = ""
+    hip = None
+    cuda = None
     try:
         torch_spec = importlib.util.find_spec("torch")
         for folder in torch_spec.submodule_search_locations:
@@ -102,9 +104,18 @@ def detect_vendor():
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 version = module.__version__
+                hip = getattr(module, "hip", None)
+                cuda = getattr(module, "cuda", None)
     except Exception as e:
         logging.warning("Failed to detect Torch version")
         pass
+
+    # torch.version.hip/cuda are authoritative. The local version segment is only
+    # a fallback: ROCm nightlies do not always carry a +rocm suffix.
+    if hip:
+        return "rocm"
+    if cuda:
+        return "cuda"
 
     if '+cu' in version:
         return "cuda"
@@ -260,6 +271,9 @@ def init(
 
     lib.set_simple_vram_headroom.argtypes = [ctypes.c_int64]
     lib.set_simple_vram_headroom.restype = None
+
+    lib.get_simple_vram_headroom.argtypes = []
+    lib.get_simple_vram_headroom.restype = ctypes.c_int64
 
     lib.set_nvml_pressure.argtypes = [ctypes.c_bool]
     lib.set_nvml_pressure.restype = None
@@ -436,6 +450,30 @@ def init(
             _xpu_allocator_ready = False
             logging.error(f"comfy-aimdo failed to install XPU allocator: {error}")
             return False
+    else:
+        lib.malloc_graph_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+        lib.malloc_graph_create.restype = ctypes.c_void_p
+
+        lib.malloc_graph_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.malloc_graph_push.restype = ctypes.c_bool
+
+        lib.malloc_graph_pause.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool]
+        lib.malloc_graph_pause.restype = ctypes.c_bool
+
+        lib.malloc_graph_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.malloc_graph_set_stream.restype = ctypes.c_bool
+
+        lib.malloc_graph_pop.argtypes = [ctypes.c_void_p]
+        lib.malloc_graph_pop.restype = ctypes.c_int
+
+        lib.malloc_graph_abort.argtypes = [ctypes.c_void_p]
+        lib.malloc_graph_abort.restype = ctypes.c_bool
+
+        lib.malloc_graph_stat.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.malloc_graph_stat.restype = ctypes.c_uint64
+
+        lib.malloc_graph_destroy.argtypes = [ctypes.c_void_p]
+        lib.malloc_graph_destroy.restype = None
 
     if simple_vram_headroom is not None:
         lib.set_simple_vram_headroom(int(simple_vram_headroom))
@@ -449,6 +487,10 @@ def init_devices(device_ids):
     if lib is None:
         return False
     if implementation == "xpu" and not _xpu_allocator_ready:
+        return False
+
+    if devctxs:
+        logging.warning("comfy-aimdo devices are already initialized, call deinit() first")
         return False
 
     requested = []
@@ -518,11 +560,43 @@ def init_device(device_id, extra_vram_headroom: int = 0):
         device_id = (device_id, extra_vram_headroom)
     return init_devices([device_id])
 
+
+def record(stream, assert_graph_breaks=False):
+    from .malloc_graph import record as malloc_graph_record
+    return malloc_graph_record(stream, assert_graph_breaks)
+
 def get_devctx(device_id: int):
     devctx = lib.get_devctx(int(device_id))
     if devctx:
         return devctx
     raise RuntimeError(f"comfy-aimdo device {device_id} is not initialized")
+
+def set_simple_vram_headroom(headroom: int):
+    """Set the VRAM the simple budget keeps free, in bytes.
+
+    One process wide value, compared against each device's own capacity. It
+    is separate from the per device extra_vram_headroom given to
+    init_devices(). Only the simple budget term reads it; the measured poll
+    term keeps its own compile time floor of 256 MB (VRAM_HEADROOM) and the
+    budget takes the larger of the two, so raising this above 256 MB is
+    honoured but lowering it below 256 MB changes nothing. Raising it takes
+    effect at the next VBAR fault or hooked device allocation and is honoured
+    by evicting VBAR pages only; torch allocations are counted against it
+    but never refused. Lowering it does not refill anything by itself: pages
+    come back when a VBAR is next prioritized, which ComfyUI does when it
+    loads a model.
+    """
+    headroom = int(headroom)
+    if headroom < 0 or headroom > (1 << 60):
+        raise ValueError("simple_vram_headroom must be between 0 and 2**60 bytes")
+    if lib is None:
+        raise RuntimeError("comfy-aimdo is not initialized")
+    lib.set_simple_vram_headroom(headroom)
+
+def get_simple_vram_headroom():
+    if lib is None:
+        raise RuntimeError("comfy-aimdo is not initialized")
+    return int(lib.get_simple_vram_headroom())
 
 def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
