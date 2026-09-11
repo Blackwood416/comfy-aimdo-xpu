@@ -11,7 +11,7 @@ After building `comfy_aimdo/aimdo_xpu.so` and the canonical wheel, run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.4.15-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.5.3-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.13.0+xpu \
@@ -26,9 +26,22 @@ import PyTorch or AIMDO.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
-state. Linux selects the global XPU pluggable allocator; Windows selects the
-native Unified Runtime hook. A failure after either becomes live is fatal
+state. The provider defaults to `native_hook` on Linux and Windows, keeping
+PyTorch's native XPU allocator. Linux also supports an explicit
+`AIMDO_XPU_ALLOCATOR_MODE=global` override.
+The manifest records supported modes separately from platform defaults.
+Linux native mode needs its verified provider DSO in `LD_PRELOAD` before Python
+starts. The standard OmniXPU entrypoint resolves the provider default and
+prepares this automatically. Direct Python launchers must prepare the preload
+before startup as well. The standalone `control.init()` API retains its Linux
+`global` default because it cannot add a preload to an already running process.
+A failure after allocator or native state becomes live is fatal
 because allocator ownership cannot be rolled back safely.
+
+Linux native VBAR recovery retries only after Torch actually returns reserved
+cache bytes. It restores the watermark from immediately before the failed fault,
+then repeats the normal pressure checks once; a caller's earlier watermark limit
+is preserved. This does not select Windows budget or retirement policy.
 
 Run the portable provider and Linux source-contract tests inside the target
 development container:

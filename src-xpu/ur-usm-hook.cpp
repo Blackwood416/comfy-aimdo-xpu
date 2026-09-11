@@ -82,6 +82,8 @@ struct RetryState {
     size_t size = 0;
     RetryReason reason = RetryReason::kNone;
     uint64_t generation = 0;
+    int aimdo_device = -1;
+    uint64_t returned_bytes = 0;
 };
 
 std::atomic<bool> g_enabled{false};
@@ -89,6 +91,10 @@ std::atomic<uint64_t> g_generation{0};
 std::atomic<uint64_t> g_stats[kHookStatCount];
 std::mutex g_hook_mutex;
 std::unordered_map<void *, Allocation> g_allocations;
+// Published only at Python/model-owner boundaries, never by re-entering the
+// native allocator from its UR callback. A hint is not a releasability proof.
+std::unordered_map<int, uint64_t> g_torch_cached_bytes;
+std::atomic<uint64_t> g_cache_lever_skipped_calls{0};
 thread_local RetryState g_retry;
 
 #ifdef AIMDO_XPU_TESTING
@@ -179,13 +185,25 @@ void arm_retry(
     ur_usm_pool_handle_t pool,
     size_t size,
     RetryReason reason,
-    uint64_t generation) {
+    uint64_t generation, int aimdo_device = -1) {
     g_retry = RetryState{
-        context, device, pool, size, reason, generation};
+        context, device, pool, size, reason, generation, aimdo_device, 0};
 }
 
 void clear_retry() {
     g_retry = RetryState{};
+}
+
+bool consume_cache_hint(int device) {
+    auto found = g_torch_cached_bytes.find(device);
+    if (found == g_torch_cached_bytes.end() || found->second == 0) {
+        return false;
+    }
+    // Consume the hint when requesting a flush, even if Torch subsequently
+    // cannot release a split/pending block. A stale estimate cannot repeatedly
+    // request the same unsuccessful flush without another owner publication.
+    found->second = 0;
+    return true;
 }
 
 int resolve_device(ur_device_handle_t device) {
@@ -403,11 +421,12 @@ extern "C" ur_result_t urUSMDeviceAlloc(
     if (torch_native_request &&
         retry_matches(context, device, pool, size, generation)) {
         const RetryReason reason = g_retry.reason;
+        const uint64_t returned_bytes = g_retry.returned_bytes;
         clear_retry();
         int64_t eviction = std::max<int64_t>(deficit, 0);
         if (reason == RetryReason::kRuntimeOom) {
-            eviction = std::max<int64_t>(
-                eviction, static_cast<int64_t>(size));
+            const size_t residual = size - std::min<size_t>(size, returned_bytes);
+            eviction = std::max<int64_t>(eviction, static_cast<int64_t>(residual));
         }
         if (eviction > 0) {
             aimdo_xpu_evict_for_allocation(aimdo_device, eviction);
@@ -424,10 +443,10 @@ extern "C" ur_result_t urUSMDeviceAlloc(
 
     clear_retry();
     if (deficit > 0) {
-        if (torch_native_request) {
+        if (torch_native_request && consume_cache_hint(aimdo_device)) {
             arm_retry(
                 context, device, pool, size,
-                RetryReason::kBudgetDeficit, generation);
+                RetryReason::kBudgetDeficit, generation, aimdo_device);
             if (pointer) {
                 *pointer = nullptr;
             }
@@ -435,16 +454,22 @@ extern "C" ur_result_t urUSMDeviceAlloc(
                 1, std::memory_order_relaxed);
             return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
         }
-        if (!aimdo_xpu_evict_for_allocation(aimdo_device, deficit)) {
+        if (torch_native_request) {
+            g_cache_lever_skipped_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool reclaimed = aimdo_xpu_evict_for_allocation(aimdo_device, deficit);
+        if (!reclaimed && !torch_native_request) {
             if (pointer) {
                 *pointer = nullptr;
             }
             return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
         }
-        g_stats[kDirectPressureCalls].fetch_add(
-            1, std::memory_order_relaxed);
-        g_stats[kDirectPressureBytes].fetch_add(
-            static_cast<uint64_t>(deficit), std::memory_order_relaxed);
+        if (!torch_native_request) {
+            g_stats[kDirectPressureCalls].fetch_add(
+                1, std::memory_order_relaxed);
+            g_stats[kDirectPressureBytes].fetch_add(
+                static_cast<uint64_t>(deficit), std::memory_order_relaxed);
+        }
     }
 
     ur_result_t result = real_allocate_and_account(
@@ -456,7 +481,7 @@ extern "C" ur_result_t urUSMDeviceAlloc(
     if (torch_native_request && is_oom(result)) {
         arm_retry(
             context, device, pool, size,
-            RetryReason::kRuntimeOom, generation);
+            RetryReason::kRuntimeOom, generation, aimdo_device);
     }
     return result;
 }
@@ -490,8 +515,11 @@ extern "C" ur_result_t urUSMFree(
     aimdo_xpu_account_allocation(
         found->second.device, -static_cast<int64_t>(found->second.size));
     if (g_retry.reason != RetryReason::kNone &&
+        g_retry.context == context &&
+        g_retry.aimdo_device == found->second.device &&
         g_retry.generation ==
             g_generation.load(std::memory_order_relaxed)) {
+        g_retry.returned_bytes += found->second.size;
         g_stats[kNativeReclaimFreeCalls].fetch_add(
             1, std::memory_order_relaxed);
         g_stats[kNativeReclaimFreeBytes].fetch_add(
@@ -528,6 +556,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_enable() {
         return true;
     }
     g_generation.fetch_add(1, std::memory_order_relaxed);
+    g_torch_cached_bytes.clear();
     clear_retry();
     g_enabled.store(true, std::memory_order_release);
     return true;
@@ -540,6 +569,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_disable() {
     }
     g_enabled.store(false, std::memory_order_release);
     g_generation.fetch_add(1, std::memory_order_relaxed);
+    g_torch_cached_bytes.clear();
     clear_retry();
     return true;
 }
@@ -553,4 +583,26 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_get_stats(
         values[i] = g_stats[i].load(std::memory_order_relaxed);
     }
     return true;
+}
+
+extern "C" AIMDO_XPU_EXPORT void xpu_ur_hook_set_torch_cached_bytes(
+    int device, uint64_t bytes) {
+    if (device < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    try {
+        g_torch_cached_bytes.insert_or_assign(device, bytes);
+    } catch (...) {
+        // Missing advisory metadata skips the optional cache-flush request.
+        // It must never throw through the C ABI or lose allocation accounting.
+        g_torch_cached_bytes.erase(device);
+    }
+}
+
+extern "C" AIMDO_XPU_EXPORT uint64_t xpu_ur_hook_get_cache_lever_skipped_calls() {
+    return g_cache_lever_skipped_calls.load(std::memory_order_relaxed);
 }

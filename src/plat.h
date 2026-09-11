@@ -230,6 +230,15 @@ fail:
     return err;
 }
 
+/* vrambuf.c */
+#if defined(__HIP_PLATFORM_AMD__) && defined(_WIN32)
+bool va_pool_init(void);
+void va_pool_cleanup(void);
+#else
+static inline bool va_pool_init(void) { return true; }
+static inline void va_pool_cleanup(void) {}
+#endif
+
 /* model_vbar.c */
 size_t vbars_free(ssize_t size);
 SHARED_EXPORT
@@ -273,8 +282,14 @@ int aimdo_cuda_malloc_async(CUdeviceptr *devPtr, size_t size, CUstream hStream,
 int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
                           CUresult (*true_cuMemFreeAsync)(CUdeviceptr, CUstream));
 
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
+bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
+bool malloc_graph_sync_paused(void);
+
 bool allocations_init(void);
 void allocations_cleanup(void);
+void allocations_lock(void);
+void allocations_unlock(void);
 void allocations_analyze(bool only_dirty);
 SHARED_EXPORT
 void aimdo_analyze(void *devctx);

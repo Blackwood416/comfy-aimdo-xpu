@@ -126,7 +126,10 @@ jobs:
     name: Publish to PyPI
     needs: [build_wheels]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    if: >-
+      github.repository == 'Comfy-Org/comfy-aimdo' &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
     environment: pypi
     permissions:
       id-token: write  # Required for Trusted Publishing

@@ -568,6 +568,7 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
 static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
     size_t pages_needed;
     bool dirty = false;
+    bool sync = !malloc_graph_sync_paused();
 
     if (size <= 0) {
         return 0;
@@ -586,7 +587,12 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
         }
         for (;pages_needed && i->watermark > i->watermark_limit; i->watermark--) {
             if (!dirty) {
-                CHECK_CU(cuCtxSynchronize());
+                /* CUDA graph callers must pre-synchronize and pin every VBAR page
+                 * referenced by the graph before allowing unsynchronized eviction.
+                 */
+                if (sync) {
+                    CHECK_CU(cuCtxSynchronize());
+                }
                 dirty = true;
             }
             if (mod1(i, i->watermark - 1, true, false)) {
@@ -595,7 +601,7 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
         }
     }
 
-    if (dirty) {
+    if (dirty && sync) {
         CHECK_CU(cuCtxSynchronize());
     }
 
