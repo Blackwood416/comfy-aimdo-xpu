@@ -7,12 +7,13 @@ accounting releases at `urUSMFree`.
 
 Linux and Windows expose the same control interface, but attach differently:
 
-- Linux `native_hook` is an explicit mode and must be interposed before Python
-  starts;
+- Linux `native_hook` must be interposed before Python starts; the standard
+  OmniXPU entrypoint prepares the provider's native default automatically;
 - Windows resolves the `ur_loader.dll` selected by
   `ur_win_proxy_loader.dll` and attaches Detours during AIMDO initialization;
-- Linux `global` remains the default Linux mode and replaces PyTorch's XPU
-  allocator with AIMDO's pluggable allocator;
+- Linux `global` remains the standalone `control.init()` API default and
+  replaces PyTorch's XPU allocator with AIMDO's pluggable allocator; provider
+  users can select it explicitly;
 - Windows never replaces PyTorch's allocator, including when the hook is
   disabled for diagnosis.
 
