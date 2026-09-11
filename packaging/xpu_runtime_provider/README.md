@@ -34,6 +34,11 @@ starts. A compatible OmniXPU entrypoint prepares this when
 `AIMDO_XPU_ALLOCATOR_MODE=native_hook` is explicit. A failure after either becomes live is fatal
 because allocator ownership cannot be rolled back safely.
 
+Linux native VBAR recovery retries only after Torch actually returns reserved
+cache bytes. It restores the watermark from immediately before the failed fault,
+then repeats the normal pressure checks once; a caller's earlier watermark limit
+is preserved. This does not select Windows budget or retirement policy.
+
 Run the portable provider and Linux source-contract tests inside the target
 development container:
 

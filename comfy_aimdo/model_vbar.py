@@ -376,6 +376,10 @@ class ModelVBAR:
         offset = alloc - self.base_addr
         # +2, one for misalignment and one for rounding
         signature = (ctypes.c_uint32 * (size // (32 * 1024 ** 2) + 2))()
+        native_watermark = None
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            native_watermark = lib.vbar_get_watermark(self._devctx, self._ptr)
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
         if res == 1:
             # This is a model-owner boundary, outside the native allocator/UR
@@ -385,6 +389,15 @@ class ModelVBAR:
             # re-entry would violate native ownership.
             cache_released = _release_native_cache(self.device)
             if cache_released:
+                if native_watermark is not None:
+                    # The first Linux fault may lower the watermark before
+                    # Python can return native dead cache. Restore only the
+                    # pre-fault range after that real release, then let the
+                    # ordinary fault recheck current pressure. An explicit
+                    # caller watermark is preserved; no range is widened.
+                    lib.vbar_set_watermark(
+                        self._devctx, self._ptr,
+                        native_watermark * (32 * 1024 ** 2))
                 # The shortage was at least partly Torch's own dead cache,
                 # which AIMDO has no other way to reclaim. Retry once now that
                 # it is back, rather than streaming this weight from host.

@@ -85,6 +85,32 @@ def test_failed_stats_do_not_replace_vbar_oom(native, monkeypatch):
     assert not model_vbar._release_native_cache(0)
 
 
+@pytest.mark.parametrize("watermark,released", [(1, 32), (0, 32), (1, 0)])
+def test_fault_retries_with_original_watermark_only_after_release(native, monkeypatch, watermark, released):
+    state, _ = native
+    state["released"] = released
+    calls = []
+    current = [watermark]
+    def fault(*args):
+        calls.append(("fault", current[0]))
+        if len(calls) == 1:
+            current[0] = 0
+            return 1
+        return 0 if current[0] else 1
+    def restore(ctx, ptr, size):
+        calls.append(("restore", size))
+        current[0] = size // (32 * 1024 ** 2)
+    monkeypatch.setattr(model_vbar, "lib", SimpleNamespace(
+        vbar_get_watermark=lambda *args: current[0], vbar_fault=fault,
+        vbar_set_watermark=restore))
+    monkeypatch.setattr(control, "capture_xpu_oom_snapshot", lambda *args, **kwargs: None)
+    vbar = SimpleNamespace(base_addr=4096, device=0, _devctx=1, _ptr=2)
+    result = model_vbar.ModelVBAR.fault(vbar, 4096, 32 * 1024 ** 2)
+    assert (result is not None) == bool(watermark and released)
+    assert calls == ([("fault", watermark), ("restore", watermark * 32 * 1024 ** 2),
+                      ("fault", watermark)] if released else [("fault", watermark)])
+
+
 @pytest.mark.parametrize("registered", [True, False])
 def test_linux_native_unpin_registers_queue_before_releasing_pin(native, monkeypatch, registered):
     calls = []
