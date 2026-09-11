@@ -26,12 +26,16 @@ import PyTorch or AIMDO.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
-state. Linux defaults to the global XPU pluggable allocator and also advertises
-opt-in `native_hook`; Windows selects the native Unified Runtime hook.
+state. The provider defaults to `native_hook` on Linux and Windows, keeping
+PyTorch's native XPU allocator. Linux also supports an explicit
+`AIMDO_XPU_ALLOCATOR_MODE=global` override.
 The manifest records supported modes separately from platform defaults.
 Linux native mode needs its verified provider DSO in `LD_PRELOAD` before Python
-starts. A compatible OmniXPU entrypoint prepares this when
-`AIMDO_XPU_ALLOCATOR_MODE=native_hook` is explicit. A failure after either becomes live is fatal
+starts. The standard OmniXPU entrypoint resolves the provider default and
+prepares this automatically. Direct Python launchers must prepare the preload
+before startup as well. The standalone `control.init()` API retains its Linux
+`global` default because it cannot add a preload to an already running process.
+A failure after allocator or native state becomes live is fatal
 because allocator ownership cannot be rolled back safely.
 
 Linux native VBAR recovery retries only after Torch actually returns reserved

@@ -111,7 +111,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
                 "linux": ["global", "native_hook"],
                 "win32": ["native_hook"],
             },
-            "default_allocator_modes": {"linux": "global", "win32": "native_hook"},
+            "default_allocator_modes": {"linux": "native_hook", "win32": "native_hook"},
         }
         assert manifest["native_artifacts"] == [
             {

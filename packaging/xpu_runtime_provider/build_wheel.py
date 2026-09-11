@@ -186,7 +186,7 @@ def _manifest(
                 "linux": ["global", "native_hook"],
                 "win32": ["native_hook"],
             },
-            "default_allocator_modes": {"linux": "global", "win32": "native_hook"},
+            "default_allocator_modes": {"linux": "native_hook", "win32": "native_hook"},
         },
         "vendor_root": f"{PROVIDER_PACKAGE}/_vendor",
         "vendored_files": file_hashes,
