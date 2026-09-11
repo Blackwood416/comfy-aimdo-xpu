@@ -734,7 +734,14 @@ def get_xpu_ur_hook_stats():
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_ur_hook_get_stats(values, len(names)):
         raise RuntimeError("failed to query AIMDO XPU UR hook statistics")
-    return dict(zip(names, map(int, values)))
+    result = dict(zip(names, map(int, values)))
+    if hasattr(lib, "xpu_ur_hook_get_cache_lever_skipped_calls"):
+        lib.xpu_ur_hook_get_cache_lever_skipped_calls.argtypes = []
+        lib.xpu_ur_hook_get_cache_lever_skipped_calls.restype = ctypes.c_uint64
+        result["cache_lever_skipped_calls"] = int(
+            lib.xpu_ur_hook_get_cache_lever_skipped_calls()
+        )
+    return result
 
 
 def get_xpu_ur_hook_timing():
@@ -820,7 +827,7 @@ def publish_torch_cached_bytes(device, cached_bytes=None):
 def empty_xpu_allocator_cache(wait=False):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return False
-    if platform.system() == "Windows":
+    if platform.system() == "Windows" or _xpu_allocator_mode == "native_hook":
         import torch
         torch.xpu.empty_cache()
         return True
@@ -848,8 +855,7 @@ def get_xpu_memory_snapshot(
     device_index = _xpu_device_index(device)
     owner = (
         "torch_xpu_native"
-        if platform.system() == "Windows" and
-        _xpu_allocator_mode == "native_hook"
+        if _xpu_allocator_mode == "native_hook"
         else "aimdo_xpu_pluggable"
     )
     try:
@@ -963,7 +969,7 @@ def _xpu_device_index(device=None):
 def get_xpu_allocator_memory_stats(device=None):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return (0, 0, 0, 0)
-    if platform.system() == "Windows":
+    if platform.system() == "Windows" or _xpu_allocator_mode == "native_hook":
         import torch
         stats = torch.xpu.memory_stats(device)
         return (
@@ -983,7 +989,7 @@ def get_xpu_allocator_memory_stats(device=None):
 def reset_xpu_allocator_peak_stats(device=None):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return
-    if platform.system() == "Windows":
+    if platform.system() == "Windows" or _xpu_allocator_mode == "native_hook":
         import torch
         torch.xpu.reset_peak_memory_stats(device)
         return

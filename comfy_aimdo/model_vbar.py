@@ -201,6 +201,43 @@ if lib is not None:
 
     lib.vbar_get_residency.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
 
+_linux_native_cache_trim_signature = {}
+
+
+def _release_linux_native_cache(device):
+    """Retry a failed VBAR page only after native reserved storage was returned.
+
+    Native dead bytes may be split or await another stream. Remember an
+    unsuccessful attempt's state so unchanged cache cannot cause repeated
+    flushes. Native physical allocation/free counters distinguish later cache
+    generations with the same byte counts. There is no Windows time/size policy
+    here; the real VBAR miss and actual returned bytes bound recovery.
+    """
+    try:
+        import torch
+
+        stats = torch.xpu.memory_stats(device)
+        reserved = int(stats.get("reserved_bytes.all.current", 0))
+        allocated = int(stats.get("allocated_bytes.all.current", 0))
+        control.publish_torch_cached_bytes(device, max(0, reserved - allocated))
+        if reserved <= allocated:
+            return False
+        hook = control.get_xpu_ur_hook_stats()
+        signature = (reserved, allocated, hook.get("tracked_alloc_calls", 0),
+                     hook.get("tracked_free_calls", 0))
+        if _linux_native_cache_trim_signature.get(device) == signature:
+            return False
+        _linux_native_cache_trim_signature[device] = signature
+        torch.xpu.empty_cache()
+        after = torch.xpu.memory_stats(device)
+        after_reserved = int(after.get("reserved_bytes.all.current", 0))
+        after_allocated = int(after.get("allocated_bytes.all.current", 0))
+        control.publish_torch_cached_bytes(device, max(0, after_reserved - after_allocated))
+        return after_reserved < reserved
+    except Exception:
+        return False
+
+
 def _release_native_cache(device):
     """Return Torch's freed-but-cached device memory, if that is the shortage.
 
@@ -209,6 +246,11 @@ def _release_native_cache(device):
     something was released and a refault is worth attempting.
     """
     global _native_cache_trim_last
+
+    if (_native_cache_trim_enabled and sys.platform == "linux"
+            and control.implementation == "xpu"
+            and control.get_xpu_allocator_mode() == "native_hook"):
+        return _release_linux_native_cache(device)
 
     if (not _native_cache_trim_enabled
             or sys.platform != "win32"
@@ -269,6 +311,9 @@ class ModelVBAR:
                 self._devctx, self._ptr
             )
         lib.vbar_prioritize(self._devctx, self._ptr, malloc_async_clamp)
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            control.publish_torch_cached_bytes(self.device)
         if sys.platform == "win32":
             _, reserved, _, peak_reserved = (
                 control.get_xpu_allocator_memory_stats(self.device)
@@ -397,6 +442,19 @@ class ModelVBAR:
 
     def unpin(self, alloc, size, stream=None):
         offset = alloc - self.base_addr
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            # The pluggable allocator registers allocation queues itself.
+            # Native Torch does not pass its queue through that allocator, so
+            # publish the actual VBAR consumer before dropping the model pin.
+            # Linux reclaim already waits all registered queues; keep that
+            # synchronized policy instead of importing Windows retirement.
+            register = lib.aimdo_xpu_register_consumer_queue
+            register.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            register.restype = ctypes.c_bool
+            queue = _consumer_queue_ptr(self.device, stream)
+            if not queue or not register(queue, self.device):
+                raise RuntimeError("Linux native VBAR consumer queue is unknown; pin retained")
         if _unpin_stream_supported:
             # VBAR map/unmap carry no stream, so this is the only point where
             # the queue that actually consumed the weight is visible. ComfyUI

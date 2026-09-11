@@ -183,9 +183,10 @@ def _manifest(
             "strategy": "canonical_control_overlay",
             "requires_dynamic_vram": True,
             "allocator_modes": {
-                "linux": ["global"],
+                "linux": ["global", "native_hook"],
                 "win32": ["native_hook"],
             },
+            "default_allocator_modes": {"linux": "global", "win32": "native_hook"},
         },
         "vendor_root": f"{PROVIDER_PACKAGE}/_vendor",
         "vendored_files": file_hashes,
