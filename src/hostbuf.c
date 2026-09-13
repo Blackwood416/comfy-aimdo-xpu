@@ -278,10 +278,11 @@ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
         CUresult copy_result;
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* Match hostbuf_file_reader_read(): record pressure here and let the
-         * next VBAR owner boundary mutate mappings. */
+        /* The destination was already allocated; a copy does not grow VRAM.
+         * Record only live pressure here, leaving mapping changes to the
+         * next VBAR owner boundary. */
         {
-            ssize_t deficit = budget_deficit(chunk);
+            ssize_t deficit = budget_deficit(0);
 
             if (deficit > 0) {
                 vbars_request_reclaim(deficit);

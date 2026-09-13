@@ -6,6 +6,7 @@
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 #include <windows.h>
+#include "xpu-copy-pressure.h"
 
 /* Diagnostic switch for the streaming-path reclaim, so its effect can be
  * measured on the real workload instead of assumed. */
@@ -122,35 +123,28 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
          * deadlock forward progress when the synchronous H2D wait itself is
          * the operation that cannot complete under residency pressure.
          *
-         * An exact allocation-fit deficit is insufficient for WDDM progress:
+         * A live deficit can require additional room for WDDM progress:
          * both 32 MiB and 512 MiB targeted reclaim completed, but the following
          * SYCL copy still waited forever in urEventWait. Once a real shortage
          * exists, use caching-allocator OOM semantics and flush every VBAR page
          * whose recorded consumers are provably complete. Do not do this while
-         * the copy still fits, because that would churn weights on every H2D.
+         * there is no live deficit. The destination has already been counted
+         * by its allocation; adding chunk again would turn a harmless copy
+         * near the budget boundary into a full working-set eviction.
          *
          * Never wait here. Re-sample after the flush and preserve only a real
          * remaining deficit for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
-            ssize_t fit_deficit = budget_deficit(chunk);
-            ssize_t post_reclaim_deficit = fit_deficit;
-            size_t reclaimed_pages = 0;
-
-            if (fit_deficit > 0) {
-                reclaimed_pages = vbars_free_all_retired();
-                post_reclaim_deficit = budget_deficit(chunk);
-                if (post_reclaim_deficit > 0) {
-                    vbars_request_reclaim(post_reclaim_deficit);
-                }
-            }
+            AimdoXpuCopyPressure pressure = aimdo_xpu_prepare_h2d();
             if (aimdo_stream_reclaim_trace_enabled()) {
                 fprintf(stderr,
                         "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
                         "size=%zu fit_deficit=%lld reclaimed_pages=%zu "
                         "post_reclaim_deficit=%lld\n",
                         (void *)(uintptr_t)device_ptr, chunk,
-                        (long long)fit_deficit, reclaimed_pages,
-                        (long long)post_reclaim_deficit);
+                        (long long)pressure.fit_deficit,
+                        pressure.reclaimed_pages,
+                        (long long)pressure.post_reclaim_deficit);
                 fflush(stderr);
             }
         }

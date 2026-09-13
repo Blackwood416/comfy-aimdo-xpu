@@ -78,17 +78,17 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
         "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))", 2
     )[2].split("#endif", 1)[0]
 
-    assert "fit_deficit = budget_deficit(chunk);" in windows_path
-    assert "fit_deficit > 0" in windows_path
-    assert "reclaimed_pages = vbars_free_all_retired();" in windows_path
-    assert "post_reclaim_deficit = budget_deficit(chunk);" in windows_path
-    assert "vbars_request_reclaim(post_reclaim_deficit);" in windows_path
-    assert source.index("reclaimed_pages = vbars_free_all_retired();") < source.index(
+    assert "AimdoXpuCopyPressure pressure = aimdo_xpu_prepare_h2d();" in windows_path
+    assert source.index("aimdo_xpu_prepare_h2d();") < source.index(
         "CUresult copy_result = cuMemcpyHtoDAsync"
     )
     assert '"[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "' in windows_path
     assert '"post_reclaim_deficit=%lld\\n"' in windows_path
     assert "cuCtxSynchronize" not in windows_path
+    policy = (Path(__file__).resolve().parents[1] / "src" / "xpu-copy-pressure.h").read_text(encoding="utf-8")
+    assert "vbars_free_all_retired();" in policy
+    assert "vbars_request_reclaim(pressure.post_reclaim_deficit);" in policy
+    assert "cuCtxSynchronize" not in policy
 
 
 def test_windows_owner_boundary_consumes_deferred_reclaim():
