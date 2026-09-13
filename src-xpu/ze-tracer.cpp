@@ -33,6 +33,18 @@ static CRITICAL_SECTION g_xpu_allocation_lock;
 static bool g_xpu_allocation_lock_initialized;
 static XpuNativeAllocation *g_xpu_allocations[XPU_ALLOCATION_HASH_SIZE];
 static int g_xpu_tracer_user_data;
+/* When the Unified Runtime hook is the arbitration backend, every USM
+ * allocation passes through BOTH urUSMDeviceAlloc (accounted there) and the
+ * Level Zero detour below it.  Accounting in both places doubles
+ * total_vram_usage, which turns a real 50% fill into a false 100% deficit
+ * and OOMs large models.  The Level Zero side then only maintains its hash
+ * table (free needs the size) and lets the UR hook own the ledger.
+ * Ze-only mode (no UR hook / tracing fallback) keeps accounting here. */
+static bool g_ze_account_native = true;
+
+void aimdo_xpu_ze_set_account_native(bool enabled) {
+    g_ze_account_native = enabled;
+}
 
 static bool xpu_allocation_trace_enabled(void) {
     static int enabled = -1;
@@ -82,7 +94,9 @@ void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device) {
     g_xpu_allocations[bucket] = entry;
     LeaveCriticalSection(&g_xpu_allocation_lock);
 
-    aimdo_xpu_account_allocation(device, (int64_t)size);
+    if (g_ze_account_native) {
+        aimdo_xpu_account_allocation(device, (int64_t)size);
+    }
     aimdo_xpu_record_native_allocation(size);
 }
 
@@ -110,7 +124,9 @@ void aimdo_xpu_note_native_release(void *ptr) {
     if (!entry) {
         return;
     }
-    aimdo_xpu_account_allocation(entry->device, -(int64_t)entry->size);
+    if (g_ze_account_native) {
+        aimdo_xpu_account_allocation(entry->device, -(int64_t)entry->size);
+    }
     aimdo_xpu_record_native_release(entry->size);
     free(entry);
 }

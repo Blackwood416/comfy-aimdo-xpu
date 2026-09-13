@@ -50,6 +50,7 @@ extern void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device)
 extern void aimdo_xpu_note_native_release(void *ptr);
 extern bool aimdo_xpu_native_accounting_init(void);
 extern void aimdo_xpu_native_accounting_cleanup(void);
+extern void aimdo_xpu_ze_set_account_native(bool enabled);
 extern bool aimdo_xpu_tracer_install(void);
 extern void aimdo_xpu_tracer_remove(void);
 extern bool aimdo_xpu_ur_hook_install(void);
@@ -298,12 +299,16 @@ bool aimdo_setup_hooks(void) {
         aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                   "%s: Unified Runtime arbitration disabled by request; using "
                   "post-allocation Level Zero reclaim\n", __func__);
+        aimdo_xpu_ze_set_account_native(true);
     } else {
         g_ur_hook_owns_arbitration = aimdo_xpu_ur_hook_install();
         if (!g_ur_hook_owns_arbitration) {
             aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                       "%s: Unified Runtime arbitration unavailable; falling "
                       "back to post-allocation Level Zero reclaim\n", __func__);
+            aimdo_xpu_ze_set_account_native(true);
+        } else {
+            aimdo_xpu_ze_set_account_native(false);
         }
     }
 
@@ -333,6 +338,7 @@ void aimdo_teardown_hooks(void) {
     if (g_ur_hook_owns_arbitration) {
         aimdo_xpu_ur_hook_remove();
         g_ur_hook_owns_arbitration = false;
+        aimdo_xpu_ze_set_account_native(true);
     }
     g_hooks_installed = false;
 }

@@ -315,6 +315,26 @@ class ModelVBAR:
                 and control.get_xpu_allocator_mode() == "native_hook"):
             control.publish_torch_cached_bytes(self.device)
         if sys.platform == "win32":
+            # Model-owner boundary (outside the allocator/UR stack): settle
+            # before estimating activation growth.  Pending retire fences keep
+            # VBAR pages non-evictable, and PyTorch's freed-but-cached blocks
+            # both inflate reserved memory and hide pressure from the UR hook.
+            # Both are safe to release only here, never inside an allocation
+            # callback.
+            try:
+                import torch
+                torch.xpu.synchronize(self.device)
+            except Exception:
+                pass
+            try:
+                import torch
+                torch.xpu.empty_cache()
+            except Exception:
+                pass
+            try:
+                control.publish_torch_cached_bytes(self.device)
+            except Exception:
+                pass
             _, reserved, _, peak_reserved = (
                 control.get_xpu_allocator_memory_stats(self.device)
             )
@@ -388,6 +408,16 @@ class ModelVBAR:
             # snapshot from the allocation hook, where Python or allocator
             # re-entry would violate native ownership.
             cache_released = _release_native_cache(self.device)
+            # Sync the compute queue so pending retire fences from previously
+            # unpinned blocks complete; their VBAR pages then become eligible
+            # for the non-blocking reclaim inside the retried fault.  This is a
+            # model-owner boundary, outside the allocator/UR call stack, so the
+            # wait is safe (a fault may not wait while inside an allocator).
+            try:
+                import torch
+                torch.xpu.synchronize(self.device)
+            except Exception:
+                pass
             if cache_released:
                 if native_watermark is not None:
                     # The first Linux fault may lower the watermark before
@@ -398,9 +428,14 @@ class ModelVBAR:
                     lib.vbar_set_watermark(
                         self._devctx, self._ptr,
                         native_watermark * (32 * 1024 ** 2))
-                # The shortage was at least partly Torch's own dead cache,
-                # which AIMDO has no other way to reclaim. Retry once now that
-                # it is back, rather than streaming this weight from host.
+                # Retry once now that Torch's dead cache is back and pending
+                # retire fences have completed, rather than streaming this
+                # weight from host.
+                res = lib.vbar_fault(
+                    self._devctx, self._ptr, offset, size, signature)
+            else:
+                # Even without a native-cache release, completed retire fences
+                # may have freed VBAR pages.  Always retry after the sync.
                 res = lib.vbar_fault(
                     self._devctx, self._ptr, offset, size, signature)
             try:
