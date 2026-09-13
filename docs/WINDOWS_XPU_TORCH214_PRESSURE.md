@@ -170,3 +170,26 @@ These checks validate the missing completion bridge. They do not establish
 that it fixes the separately reported ClipProj access violation or meets the
 workflow performance thresholds. Full workflow results remain in the external
 acceptance directory.
+
+## Native cache before file-reader pressure recovery
+
+The native allocation retry cannot return Torch cache when a file-reader copy
+is the first operation to observe pressure: the destination was already
+allocated, so no native allocation hook runs. The reader could therefore flush
+the retired VBAR working set while Torch retained 1–2 GiB of reusable cache.
+
+Both Python file-reader entry points now query the existing AIMDO physical
+budget with zero additional allocation bytes. Only a positive live deficit
+enters the existing native-cache recovery, retaining its two-second attempt
+limit and 32 MiB minimum cache check. The completion bridge above joins queues
+before releasing storage. Cache/retry hints are republished after actual
+release. The native reader still rechecks pressure and retains its full VBAR
+recovery if cache release does not resolve the shortage. CPU reads and other
+platforms do not enter this Windows policy.
+
+In the two-run Krea2 diagnostic, the old order produced a warm median of
+2.609 seconds with 8.840/8.548-second spikes. The new order invoked recovery
+twice, returning 1302 and 930 MiB in 49 and 26 ms; no full-model spike appeared.
+Cold late steps were 1.746–1.819 seconds, and warm steps were 2.166–2.249 seconds.
+This is an improvement, not the final <=2-second acceptance pass. The isolated
+reader/cache/completion regression group passed 60 tests.

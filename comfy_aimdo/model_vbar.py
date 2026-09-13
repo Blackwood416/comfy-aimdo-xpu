@@ -268,20 +268,28 @@ def _release_native_cache(device):
     try:
         import torch
 
-        stats = torch.xpu.memory_stats(device)
-        cached = (int(stats.get("reserved_bytes.all.current", 0))
-                  - int(stats.get("allocated_bytes.all.current", 0)))
+        try:
+            stats = torch.xpu.memory_stats(device)
+        except Exception:
+            return False
+        reserved = int(stats.get("reserved_bytes.all.current", 0))
+        cached = reserved - int(stats.get("allocated_bytes.all.current", 0))
         # The allocation hook needs this figure too, and cannot derive it: a
         # cached block never reaches the driver.
         control.publish_torch_cached_bytes(device, cached)
         if cached < 32 * 1024 ** 2:
             return False
+        # The Windows completion wrapper joins owned queues before freeing.
+        # Do not swallow a completion/release failure and continue a copy into
+        # the same device; only unavailable statistics are an optional signal.
         torch.xpu.empty_cache()
-    except Exception:
-        return False
+        after = torch.xpu.memory_stats(device)
+        after_reserved = int(after.get("reserved_bytes.all.current", 0))
+        control.publish_torch_cached_bytes(
+            device, max(0, after_reserved - int(after.get("allocated_bytes.all.current", 0))))
+        return after_reserved < reserved
     finally:
         _native_cache_trim_last = time.monotonic()
-    return True
 
 
 class ModelVBAR:
