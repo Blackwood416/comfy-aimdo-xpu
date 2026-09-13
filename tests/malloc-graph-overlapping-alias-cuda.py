@@ -22,12 +22,14 @@ d = torch.empty(32 * M, dtype=torch.uint8, device='cuda')
 for page in range(4):
     d[page * 8 * M:(page + 1) * 8 * M].fill_(37 + page)
 after = graph.virtual_bytes
+physical = graph.physical_bytes
 for page in range(4):
     assert d[page * 8 * M].item() == 37 + page
     assert d[(page + 1) * 8 * M - 1].item() == 37 + page
 print(json.dumps({'beforeVirtualBytes': before, 'afterVirtualBytes': after,
-                  'physicalBytes': graph.physical_bytes, 'reused': before == after}))
+                  'physicalBytes': physical, 'reused': before == after}))
 assert before == after, 'A valid overlapping range was skipped.'
+assert physical == 32 * M, f'Expected 32 MiB of physical pages, got {physical} bytes.'
 del d
 graph.pop()
 del graph
