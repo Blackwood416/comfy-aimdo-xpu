@@ -111,9 +111,7 @@ SHARED_EXPORT
 int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
                               unsigned *pin, uint64_t *page_index,
                               uint64_t *unmapped_page, uint64_t *pages_spanned);
-SHARED_EXPORT
-void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
-                       uint64_t stream);
+
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 static uint64_t vbar_identity_counter;
@@ -1238,6 +1236,7 @@ void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
     ssize_t reclaim;
 
     set_devctx((AimdoContext *)devctx);
+    aimdo_wddm_force_poll();
     /*
      * Windows cannot evict from the Level Zero allocation callback because
      * doing so waits re-entrantly on the same SYCL queue.  Its model-boundary
@@ -1479,6 +1478,9 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
         log(VERBOSE, "VBAR needs to allocate VRAM for page %d\n", (int)page_nr);
 
         allocation_deficit = budget_deficit(VBAR_PAGE_SIZE);
+        if (allocation_deficit > 0) {
+            err = CUDA_ERROR_OUT_OF_MEMORY;
+        }
         if (allocation_deficit > 0 ||
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
             (err = vbar_map_new_page(mv, (size_t)page_nr)) != CUDA_SUCCESS) {
@@ -1490,7 +1492,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                 ? (size_t)allocation_deficit
                 : (size_t)VBAR_PAGE_SIZE;
 
-            if (err != CUDA_ERROR_OUT_OF_MEMORY) {
+            if (allocation_deficit <= 0 && err != CUDA_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
                 vbar_unpin_range(mv, page_start, page_nr);
                 return VBAR_FAULT_ERROR;
@@ -1499,7 +1501,13 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                 "VBAR allocator attempt exceeds available VRAM; reclaiming %zu MB ...\n",
                 retry_reclaim / M);
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-            vbars_free_retired((ssize_t)retry_reclaim);
+            {
+                size_t unfulfilled =
+                    vbars_free_retired_except((ssize_t)retry_reclaim, mv);
+                if (unfulfilled > 0) {
+                    (void)vbars_free_retired((ssize_t)(unfulfilled * VBAR_PAGE_SIZE));
+                }
+            }
 #else
             vbars_free((ssize_t)retry_reclaim);
 #endif
@@ -1590,10 +1598,7 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size,
     return result;
 }
 
-SHARED_EXPORT
-void vbar_unpin(void *devctx, void *vbar, uint64_t offset, uint64_t size) {
-    vbar_unpin_stream(devctx, vbar, offset, size, 0);
-}
+
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 static uint64_t vbar_consumer_dependency(uint64_t stream, int device,
@@ -1791,8 +1796,7 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
      * The token call owns only the retire lock; taking it before the page lock
      * preserves the retire-lock -> VBAR-lock order used by pressure scans. A
      * missing/overflowed queue returns zero and makes the page fail closed. */
-    retirement_token = vbar_consumer_dependency(
-        stream, mv->device, &consumer_known);
+    retirement_token = vbar_consumer_dependency(stream, mv->device, &consumer_known);
 #else
     (void)stream;
 #endif
@@ -1847,6 +1851,11 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
 #endif
 
     vbar_state_unlock();
+}
+
+SHARED_EXPORT
+void vbar_unpin(void *devctx, void *vbar, uint64_t offset, uint64_t size) {
+    vbar_unpin_stream(devctx, vbar, offset, size, 0);
 }
 
 SHARED_EXPORT

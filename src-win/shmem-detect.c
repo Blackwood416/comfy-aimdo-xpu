@@ -157,6 +157,11 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     uint64_t now = GET_TICK();
 
     if (now - wddm_timestamp_last_check < 2000) {
+        if (prevailing_deficit_method) {
+            *prevailing_deficit_method = g_wddm_adapter
+                ? "WDDM budget (cached)"
+                : "physical capacity";
+        }
         return true;
     }
     wddm_timestamp_last_check = now;
@@ -229,6 +234,22 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
         if (simple_vram_headroom > wddm_headroom) {
             wddm_headroom = (ssize_t)simple_vram_headroom;
         }
+#if defined(AIMDO_XPU)
+        /* On Windows, DXGI's Budget is already reduced by the OS (e.g. 840MB+
+         * below physical vram_capacity). The headroom is intended to ensure
+         * total safety margin from physical capacity, not double-discount an
+         * already reduced OS budget. Discount the OS reservation from
+         * wddm_headroom so we don't trigger false deficits when physical VRAM
+         * is ample. */
+        if (vram_capacity > effective_budget) {
+            ssize_t os_reserve = (ssize_t)(vram_capacity - effective_budget);
+            if (wddm_headroom > os_reserve) {
+                wddm_headroom -= os_reserve;
+            } else {
+                wddm_headroom = 0;
+            }
+        }
+#endif
         deficit_sync = (ssize_t)effective_usage + wddm_headroom -
                        (ssize_t)effective_budget;
     }
@@ -251,7 +272,14 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     used_nvml = nvml_device && aimdo_nvml_memory_info(nvml_device, &free_vram, &total_vram);
 #endif
     if (used_nvml || CHECK_CU(cuMemGetInfo(&free_vram, &total_vram))) {
+#if defined(AIMDO_XPU)
+        ssize_t headroom = (ssize_t)WDDM_BUDGET_HEADROOM;
+        if (simple_vram_headroom > headroom) {
+            headroom = (ssize_t)simple_vram_headroom;
+        }
+#else
         ssize_t headroom = used_nvml ? NVML_BUDGET_HEADROOM : CUDA_BUDGET_HEADROOM / 2;
+#endif
         ssize_t deficit_cuda = headroom - (ssize_t)free_vram;
 
         log(DEBUG,
