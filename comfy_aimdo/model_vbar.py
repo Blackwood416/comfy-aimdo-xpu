@@ -400,6 +400,19 @@ class ModelVBAR:
         if (sys.platform == "linux" and control.implementation == "xpu"
                 and control.get_xpu_allocator_mode() == "native_hook"):
             native_watermark = lib.vbar_get_watermark(self._devctx, self._ptr)
+        if (sys.platform == "win32" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            # A freed Torch block can remain cached without reaching the UR
+            # hook. Refresh the hint outside the allocator lock, before this
+            # weight's cast/LoRA allocations. Publishing does not release any
+            # storage: the hook still requests a cache retry only on a real
+            # allocation deficit. A successful resident fault must refresh it
+            # too, since that is the common path between activation kernels.
+            try:
+                control.publish_torch_cached_bytes(self.device)
+            except Exception:
+                # Unavailable allocator statistics must not break VBAR access.
+                pass
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
         if res == 1:
             # This is a model-owner boundary, outside the native allocator/UR
