@@ -321,16 +321,18 @@ class ModelVBAR:
             # both inflate reserved memory and hide pressure from the UR hook.
             # Both are safe to release only here, never inside an allocation
             # callback.
-            try:
-                import torch
+            import torch
+            if control.implementation == "xpu":
+                # The provider joins owned SYCL queues before these calls.
+                # A failed completion must prevent cache release/reclaim.
                 torch.xpu.synchronize(self.device)
-            except Exception:
-                pass
-            try:
-                import torch
                 torch.xpu.empty_cache()
-            except Exception:
-                pass
+            else:
+                try:
+                    torch.xpu.synchronize(self.device)
+                    torch.xpu.empty_cache()
+                except Exception:
+                    pass
             try:
                 control.publish_torch_cached_bytes(self.device)
             except Exception:
@@ -426,11 +428,15 @@ class ModelVBAR:
             # for the non-blocking reclaim inside the retried fault.  This is a
             # model-owner boundary, outside the allocator/UR call stack, so the
             # wait is safe (a fault may not wait while inside an allocator).
-            try:
+            if sys.platform == "win32" and control.implementation == "xpu":
                 import torch
                 torch.xpu.synchronize(self.device)
-            except Exception:
-                pass
+            else:
+                try:
+                    import torch
+                    torch.xpu.synchronize(self.device)
+                except Exception:
+                    pass
             if cache_released:
                 if native_watermark is not None:
                     # The first Linux fault may lower the watermark before
@@ -446,9 +452,10 @@ class ModelVBAR:
                 # weight from host.
                 res = lib.vbar_fault(
                     self._devctx, self._ptr, offset, size, signature)
-            else:
+            elif sys.platform == "win32" and control.implementation == "xpu":
                 # Even without a native-cache release, completed retire fences
-                # may have freed VBAR pages.  Always retry after the sync.
+                # may have freed Windows VBAR pages. Linux retains its
+                # retry-only-after-actual-cache-release contract.
                 res = lib.vbar_fault(
                     self._devctx, self._ptr, offset, size, signature)
             try:

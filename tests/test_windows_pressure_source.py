@@ -375,11 +375,12 @@ def test_windows_queue_registry_owns_and_validates_queue_identity():
     assert "retire_queue.context == context" in dispatch
     assert "retire_queue.device == device" in dispatch
     assert "*retire_queue.queue == *queue" in dispatch
-    context_sync = dispatch.split("CUresult xpu_context_synchronize()", 1)[1]
+    context_sync = dispatch.split("CUresult xpu_synchronize_device_queues(", 1)[1]
     context_sync = context_sync.split("\n}\n", 1)[0]
     lock_end = context_sync.index("for (sycl::queue &queue : queues)")
     assert context_sync.index("std::lock_guard<std::mutex>") < lock_end
     assert context_sync.index("queue.wait_and_throw();") > lock_end
+    assert "return xpu_synchronize_device_queues(current_device());" in dispatch
 
 
 def test_windows_explicit_consumer_and_capture_fail_closed_are_exposed():

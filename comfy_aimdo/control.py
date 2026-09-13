@@ -1,5 +1,6 @@
 import os
 import ctypes
+import functools
 import platform
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ _xpu_oom_history = []
 _XPU_OOM_HISTORY_LIMIT = 4
 _XPU_OOM_SNAPSHOT_INTERVAL_SECONDS = 2.0
 _xpu_oom_last_snapshot_monotonic = {}
+_windows_xpu_completion_hooks = []
 
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
@@ -293,6 +295,8 @@ def init(
                                           ctypes.c_size_t]
         lib.xpu_get_vmm_stats.restype = ctypes.c_bool
         if platform.system() == "Windows":
+            lib.xpu_synchronize_queues.argtypes = [ctypes.c_int, ctypes.c_uint64]
+            lib.xpu_synchronize_queues.restype = ctypes.c_bool
             lib.aimdo_xpu_is_mapped_pinned_vbar.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_size_t,
@@ -549,6 +553,8 @@ def init_devices(device_ids):
                 "comfy-aimdo XPU native allocator hook enabled; "
                 "PyTorch caching allocator retained"
             )
+        if implementation == "xpu" and platform.system() == "Windows":
+            _install_windows_xpu_completion_hooks(torch)
         return True
 
     devctxs = []
@@ -570,6 +576,72 @@ def get_devctx(device_id: int):
     if devctx:
         return devctx
     raise RuntimeError(f"comfy-aimdo device {device_id} is not initialized")
+
+
+def synchronize_xpu_queues(device=None):
+    """Complete AIMDO's registered queues and the caller's current queue.
+
+    Called only from a model-owner stack, outside Torch's allocator lock.
+    A false result means AIMDO does not own this device; native wait failures
+    raise so callers cannot release storage after incomplete GPU work.
+    """
+    if lib is None or implementation != "xpu" or not devctxs:
+        return False
+    device_index = _xpu_device_index(device)
+    if not lib.get_devctx(device_index):
+        return False
+    import torch
+
+    stream = torch.xpu.current_stream(device_index)
+    if not lib.xpu_synchronize_queues(device_index, int(stream.sycl_queue)):
+        raise RuntimeError(
+            f"AIMDO XPU queue completion failed on device {device_index}"
+        )
+    return True
+
+
+def _install_windows_xpu_completion_hooks(torch_module):
+    """Reconnect existing synchronize/empty_cache boundaries to SYCL queues.
+
+    Device-wide waits in the Torch 2.14 Windows runtime can return before a
+    native kernel's SYCL batch has been submitted. Waiting the owned queues
+    first preserves the original completion contract, including ClipProj's
+    soft_empty_cache path. No extra waits are added to successful VBAR faults.
+    """
+    if _windows_xpu_completion_hooks:
+        return
+    xpu = torch_module.xpu
+    original_sync = xpu.synchronize
+    original_empty = xpu.empty_cache
+
+    @functools.wraps(original_sync)
+    def synchronize(device=None):
+        synchronize_xpu_queues(device)
+        return original_sync(device)
+
+    @functools.wraps(original_empty)
+    def empty_cache():
+        # Torch's empty_cache has no device argument and drains every device.
+        for device in range(xpu.device_count()):
+            synchronize_xpu_queues(device)
+        return original_empty()
+
+    for owner, name, replacement in (
+        (xpu, "synchronize", synchronize),
+        (xpu, "empty_cache", empty_cache),
+        (xpu.memory, "empty_cache", empty_cache),
+    ):
+        original = getattr(owner, name)
+        setattr(owner, name, replacement)
+        _windows_xpu_completion_hooks.append((owner, name, original, replacement))
+
+
+def _restore_windows_xpu_completion_hooks():
+    for owner, name, original, replacement in reversed(_windows_xpu_completion_hooks):
+        if getattr(owner, name) is replacement:
+            setattr(owner, name, original)
+    _windows_xpu_completion_hooks.clear()
+
 
 def set_simple_vram_headroom(headroom: int):
     """Set the VRAM the simple budget keeps free, in bytes.
@@ -624,6 +696,7 @@ def deinit():
         lib.plat_cleanup()
         lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
         _log_callback = None
+    _restore_windows_xpu_completion_hooks()
     lib = None
     globals()["implementation"] = None
     _xpu_allocator_ready = False

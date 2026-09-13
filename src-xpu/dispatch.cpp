@@ -383,8 +383,7 @@ CUresult xpu_context_get_device(CUdevice *device) {
     return CUDA_SUCCESS;
 }
 
-CUresult xpu_context_synchronize() {
-    auto *state = current_device();
+CUresult xpu_synchronize_device_queues(XpuDeviceState *state) {
     if (!state) {
         return kCudaErrorUnknown;
     }
@@ -421,6 +420,10 @@ CUresult xpu_context_synchronize() {
         trace_sync("context", "error", call, state->queue);
         return kCudaErrorUnknown;
     }
+}
+
+CUresult xpu_context_synchronize() {
+    return xpu_synchronize_device_queues(current_device());
 }
 
 CUresult xpu_device_get(CUdevice *device, int ordinal) {
@@ -1311,6 +1314,21 @@ bool aimdo_xpu_register_consumer_queue(void *queue_pointer, int device) {
 
     std::lock_guard<std::mutex> guard(g_retire_mutex);
     return aimdo_xpu_note_queue_locked(queue, device) < kMaxTrackedQueues;
+}
+
+/* Model-owner completion boundary, never an allocator callback. Torch's
+ * device-wait shortcut can miss unsubmitted SYCL command-list batches.
+ * Register the caller's current queue before reusing the owned queue waits
+ * already used by VBAR release. The registry lock is not held while waiting. */
+AIMDO_XPU_EXPORT bool xpu_synchronize_queues(
+    int device, uint64_t queue_pointer) {
+    auto *state = find_device(device);
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!state || !queue ||
+        !aimdo_xpu_register_consumer_queue(queue, device)) {
+        return false;
+    }
+    return xpu_synchronize_device_queues(state) == CUDA_SUCCESS;
 }
 
 uint64_t aimdo_xpu_retire_token_current(void *queue_pointer, int device) {
