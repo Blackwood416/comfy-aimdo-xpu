@@ -95,6 +95,7 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
     return true;
 }
 
+SHARED_EXPORT
 bool aimdo_xpu_allocation_deficit(int device, size_t size, int64_t *deficit) {
     if (!deficit || !set_devctx_for_device(device)) {
         return false;

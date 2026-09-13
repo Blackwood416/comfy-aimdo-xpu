@@ -297,6 +297,10 @@ def init(
         if platform.system() == "Windows":
             lib.xpu_synchronize_queues.argtypes = [ctypes.c_int, ctypes.c_uint64]
             lib.xpu_synchronize_queues.restype = ctypes.c_bool
+            lib.aimdo_xpu_allocation_deficit.argtypes = [
+                ctypes.c_int, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int64),
+            ]
+            lib.aimdo_xpu_allocation_deficit.restype = ctypes.c_bool
             lib.aimdo_xpu_is_mapped_pinned_vbar.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_size_t,
@@ -598,6 +602,24 @@ def synchronize_xpu_queues(device=None):
             f"AIMDO XPU queue completion failed on device {device_index}"
         )
     return True
+
+
+def get_xpu_memory_deficit(device, allocation_bytes=0):
+    """Read the same physical budget used by VBAR and native allocation.
+
+    This owner-side query neither evicts pages nor changes the cache. A copy
+    into an existing destination uses allocation_bytes=0, since its storage
+    was already charged when mapped/allocated.
+    """
+    if allocation_bytes < 0:
+        raise ValueError("allocation_bytes must not be negative")
+    if lib is None or implementation != "xpu":
+        return None
+    deficit = ctypes.c_int64()
+    if not lib.aimdo_xpu_allocation_deficit(
+            _xpu_device_index(device), int(allocation_bytes), ctypes.byref(deficit)):
+        return None
+    return int(deficit.value)
 
 
 def _install_windows_xpu_completion_hooks(torch_module):
