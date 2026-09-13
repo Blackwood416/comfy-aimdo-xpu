@@ -930,11 +930,17 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
     size_t pages = ALIGN_UP(size, MG_PAGE) / MG_PAGE;
 
     while (va + pages <= g->va_count) {
-        size_t j;
+        size_t j, advance = 0;
         for (j = 0; j < pages; j++) {
             int phys = g->va_phys[va + j];
             if (rogue_va(g, va + j) || g->allocations.physical_live[phys] ||
                 rogue_phys(g, phys)) {
+                // A duplicate within this candidate is only temporarily live.
+                // Skip past its earlier occurrence, not past the duplicate:
+                // an overlapping candidate may contain unique free pages.
+                for (size_t k = 0; k < j; k++) {
+                    if (g->va_phys[va + k] == phys) { advance = k + 1; break; }
+                }
                 break;
             }
             g->allocations.physical_live[phys] = true;
@@ -945,7 +951,7 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
         for (size_t k = 0; k < j; k++) {
             g->allocations.physical_live[g->va_phys[va + k]] = false;
         }
-        va += j + 1;
+        va += advance ? advance : j + 1;
     }
     RETURN_G_FAILED(g->failed, true);
     if (va + pages > g->va_count) {
