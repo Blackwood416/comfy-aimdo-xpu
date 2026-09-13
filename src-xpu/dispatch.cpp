@@ -37,8 +37,25 @@ extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *m
 #define AIMDO_XPU_EXPORT __attribute__((visibility("default")))
 #endif
 
-struct CUevent_st {
+struct XpuCopyCompletion {
+    sycl::queue queue;
     sycl::event event;
+    // A failed submission may have enqueued work without returning its event.
+    bool wait_queue = false;
+
+    explicit XpuCopyCompletion(const sycl::queue &owner) : queue(owner) {}
+
+    void wait() {
+        if (wait_queue) {
+            queue.wait_and_throw();
+        } else {
+            event.wait_and_throw();
+        }
+    }
+};
+
+struct CUevent_st {
+    std::vector<XpuCopyCompletion> copies;
     bool recorded = false;
 };
 
@@ -95,10 +112,54 @@ enum XpuStat : size_t {
     kRetireQueueIdentityMismatches,
     kRetireFenceQueryFailures,
     kRetireShutdownWaitFailures,
+    kAsynchronousHostToDeviceCalls,
+    kAsynchronousHostToDeviceBytes,
+    kHostBufferWaitFailures,
     kXpuStatCount,
 };
 
 std::atomic<uint64_t> g_stats[kXpuStatCount];
+
+// Only cuMemAllocHost's three reader slots have a completion-controlled reuse
+// contract. Ordinary HostBuffer storage must retain synchronous copies.
+struct XpuReaderBuffer {
+    void *pointer;
+    size_t size;
+    std::mutex mutex;
+    bool releasing = false;
+    std::vector<XpuCopyCompletion> copies;
+
+    XpuReaderBuffer(void *address, size_t bytes) : pointer(address), size(bytes) {}
+};
+
+std::mutex g_reader_buffers_mutex;
+std::unordered_map<void *, std::shared_ptr<XpuReaderBuffer>> g_reader_buffers;
+
+bool async_reader_enabled() {
+#if defined(_WIN32) || defined(_WIN64)
+    static const bool enabled = [] {
+        const char *value = std::getenv("AIMDO_XPU_ASYNC_FILE_READER");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+std::shared_ptr<XpuReaderBuffer> reader_buffer_for(const void *source, size_t size) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(source);
+    std::lock_guard<std::mutex> guard(g_reader_buffers_mutex);
+    for (const auto &entry : g_reader_buffers) {
+        const auto &buffer = entry.second;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(buffer->pointer);
+        if (address >= base && address - base <= buffer->size &&
+            size <= buffer->size - (address - base)) {
+            return buffer;
+        }
+    }
+    return {};
+}
 
 struct XpuTorchBlock {
     void *pointer;
@@ -573,10 +634,46 @@ CUresult xpu_host_alloc(void **pointer, size_t size) {
      * moving it 56 seconds earlier. Keep pageable staging until the copy
      * failure itself is understood. */
     *pointer = std::malloc(size);
-    return *pointer ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
+    if (!*pointer) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    if (async_reader_enabled()) {
+        try {
+            auto buffer = std::make_shared<XpuReaderBuffer>(*pointer, size);
+            std::lock_guard<std::mutex> guard(g_reader_buffers_mutex);
+            g_reader_buffers.emplace(*pointer, std::move(buffer));
+        } catch (...) {
+            std::free(*pointer);
+            *pointer = nullptr;
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    return CUDA_SUCCESS;
 }
 
 CUresult xpu_host_free(void *pointer) {
+    if (pointer && async_reader_enabled()) {
+        auto buffer = reader_buffer_for(pointer, 0);
+        if (!buffer || buffer->pointer != pointer) {
+            return kCudaErrorUnknown;
+        }
+        std::lock_guard<std::mutex> guard(buffer->mutex);
+        buffer->releasing = true;
+        try {
+            // Also covers failed/missing event recording and an active slot
+            // at cleanup. Never free staging whose completion is unproven.
+            for (auto &copy : buffer->copies) {
+                copy.wait();
+            }
+        } catch (...) {
+            g_stats[kHostBufferWaitFailures].fetch_add(1, std::memory_order_relaxed);
+            return kCudaErrorUnknown;
+        }
+        {
+            std::lock_guard<std::mutex> registry_guard(g_reader_buffers_mutex);
+            g_reader_buffers.erase(pointer);
+        }
+    }
     std::free(pointer);
     return CUDA_SUCCESS;
 }
@@ -749,11 +846,39 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
     if (!queue) {
         return kCudaErrorUnknown;
     }
-    const uint64_t call = g_stats[kSynchronousHostToDeviceCalls].fetch_add(
+    const auto buffer = async_reader_enabled() ? reader_buffer_for(source, size)
+                                               : nullptr;
+    const bool asynchronous = buffer && queue->is_in_order();
+    const char *operation = asynchronous ? "h2d_async" : "h2d";
+    const uint64_t call = g_stats[asynchronous ? kAsynchronousHostToDeviceCalls
+                                             : kSynchronousHostToDeviceCalls].fetch_add(
                               1, std::memory_order_relaxed) +
                           1;
-    trace_sync("h2d", "begin", call, queue, size);
+    trace_sync(operation, "begin", call, queue, size);
     try {
+        if (asynchronous) {
+            std::lock_guard<std::mutex> guard(buffer->mutex);
+            if (buffer->releasing) {
+                return kCudaErrorUnknown;
+            }
+            auto found = std::find_if(buffer->copies.begin(), buffer->copies.end(),
+                [queue](const XpuCopyCompletion &copy) { return copy.queue == *queue; });
+            if (found == buffer->copies.end()) {
+                // Allocate tracking before submission so even an exception
+                // cannot leave a live copy with no staging/queue owner.
+                buffer->copies.emplace_back(*queue);
+                found = buffer->copies.end() - 1;
+            }
+            found->wait_queue = true;
+            found->event = queue->memcpy(reinterpret_cast<void *>(destination), source, size);
+            found->wait_queue = false;
+            // On an in-order queue the newest event covers all earlier uses
+            // of this slot. Retain each distinct queue until slot cleanup.
+            g_stats[kHostToDeviceBytes].fetch_add(size, std::memory_order_relaxed);
+            g_stats[kAsynchronousHostToDeviceBytes].fetch_add(size, std::memory_order_relaxed);
+            trace_sync(operation, "submitted", call, queue, size);
+            return CUDA_SUCCESS;
+        }
         // XPU phase 1 uses ordinary malloc-backed host buffers rather than
         // pinned host allocations. Keep their lifetime unambiguous across
         // ComfyUI workflow boundaries: complete the copy before the common
@@ -775,7 +900,7 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
          * pieces before giving up. */
         constexpr size_t kSplitChunk = 8ULL * 1024 * 1024;
 
-        if (size > kSplitChunk) {
+        if (!asynchronous && size > kSplitChunk) {
             try {
                 const auto *bytes = static_cast<const unsigned char *>(source);
                 for (size_t done = 0; done < size; done += kSplitChunk) {
@@ -896,12 +1021,40 @@ CUresult xpu_event_record(CUevent event, CUstream stream) {
     if (!event || !queue) {
         return kCudaErrorUnknown;
     }
-    // All XPU host-to-device copies are completed synchronously above. The
-    // CUDA-shaped event retained by the common file-reader is therefore an
-    // already-completed token; submitting a long-lived SYCL barrier here can
-    // retain a worker queue beyond one ComfyUI workflow.
-    event->recorded = true;
-    return CUDA_SUCCESS;
+    try {
+        event->recorded = false;
+        event->copies.clear();
+        event->copies.emplace_back(*queue);
+        event->copies.back().event = queue->ext_oneapi_submit_barrier();
+        event->recorded = true;
+        return CUDA_SUCCESS;
+    } catch (...) {
+        return kCudaErrorUnknown;
+    }
+}
+
+CUresult xpu_reader_event_record(CUevent event, void *pointer) {
+    if (!event) {
+        return kCudaErrorUnknown;
+    }
+    try {
+        event->recorded = false;
+        event->copies.clear();
+        if (async_reader_enabled()) {
+            const auto buffer = reader_buffer_for(pointer, 0);
+            if (!buffer || buffer->pointer != pointer) {
+                return kCudaErrorUnknown;
+            }
+            std::lock_guard<std::mutex> guard(buffer->mutex);
+            event->copies = buffer->copies;
+        }
+        // Snapshot the slot's actual copy owners instead of dereferencing a
+        // Torch stream pointer that may have died since its last reader use.
+        event->recorded = true;
+        return CUDA_SUCCESS;
+    } catch (...) {
+        return kCudaErrorUnknown;
+    }
 }
 
 CUresult xpu_event_synchronize(CUevent event) {
@@ -911,6 +1064,15 @@ CUresult xpu_event_synchronize(CUevent event) {
     const uint64_t call =
         g_stats[kEventSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
     trace_sync("event", "begin", call, nullptr);
+    try {
+        for (auto &copy : event->copies) {
+            copy.wait();
+        }
+    } catch (...) {
+        g_stats[kHostBufferWaitFailures].fetch_add(1, std::memory_order_relaxed);
+        trace_sync("event", "error", call, nullptr);
+        return kCudaErrorUnknown;
+    }
     g_stats[kEventSyncCompletions].fetch_add(
         1, std::memory_order_relaxed);
     trace_sync("event", "end", call, nullptr);
@@ -1274,6 +1436,10 @@ bool submit_retire_fence_locked(RetireQueue &retire_queue) {
 }
 
 }  // namespace
+
+extern "C" CUresult aimdo_xpu_record_reader_event(CUevent event, void *buffer) {
+    return xpu_reader_event_record(event, buffer);
+}
 
 extern "C" {
 

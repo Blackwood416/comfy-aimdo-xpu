@@ -108,6 +108,12 @@ typedef struct AimdoCudaDispatch {
 
 extern AimdoCudaDispatch g_cuda;
 
+#if defined(AIMDO_XPU)
+/* The reader owns staging, so its completion token must follow those copies,
+ * not a potentially expired Python stream pointer. */
+CUresult aimdo_xpu_record_reader_event(CUevent event, void *buffer);
+#endif
+
 typedef CUresult (CUDAAPI *PFN_deviceGetProperties)(void *prop, CUdevice dev);
 
 extern PFN_deviceGetProperties g_device_get_properties;

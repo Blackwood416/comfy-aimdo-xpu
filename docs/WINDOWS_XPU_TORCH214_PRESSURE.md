@@ -193,3 +193,34 @@ twice, returning 1302 and 930 MiB in 49 and 26 ms; no full-model spike appeared.
 Cold late steps were 1.746–1.819 seconds, and warm steps were 2.166–2.249 seconds.
 This is an improvement, not the final <=2-second acceptance pass. The isolated
 reader/cache/completion regression group passed 60 tests.
+
+## Opt-in reader completion bridge
+
+`AIMDO_XPU_ASYNC_FILE_READER=1` reconnects the common reader's three-slot
+pipeline on Windows XPU. It remains opt-in while workflow validation runs.
+Only malloc-backed `cuMemAllocHost` slots may submit asynchronously, and only
+on in-order queues. Ordinary HostBuffer copies keep their blocking contract.
+No pinned allocation, model cache, or attention geometry is introduced.
+
+Each slot owns its latest copy event on every queue that used it, including a
+copy of the queue itself. Retirement snapshots these actual owners rather than
+dereferencing the saved Python stream pointer. Reuse and cleanup wait for those
+events. A failed submission retains a queue-wide completion obligation; failed
+event creation/record/wait preserves staging, and checked Python cleanup raises
+instead of concealing failure. Host free independently verifies completion.
+
+The production C reader passed delayed-copy/failure-injection checks for ring
+reuse, event creation, event recording, wait failure, and partial submission.
+The selected cache/completion/pressure/reader regression group passed 74 tests.
+`tests/run_windows_xpu_reader.py` passed three real-device rounds, checking
+755,055,675 bytes in full with zero errors across alternating streams and
+cleanup. It also checked unchanged synchronous HostBuffer behavior and VBAR
+copy/consumer completion before explicit eviction. These are bounded lifecycle
+checks, not a pressure or workflow acceptance result.
+
+The preceding H3 diagnostic with the copy-cache recovery and two sampling-only
+offload streams completed without a crash but had a 53.39-second step median.
+Disabling only `AIMDO_XPU_NATIVE_CACHE_TRIM` in the same configuration reduced
+the median to 37.71 seconds. Both miss the 25-second requirement. Keep these
+negative results when evaluating the reader bridge; do not treat the Krea2
+cache-recovery improvement as a universal H3 policy.

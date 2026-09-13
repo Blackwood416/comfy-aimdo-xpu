@@ -45,6 +45,9 @@ if lib is not None:
     lib.hostbuf_file_reader_read.restype = ctypes.c_bool
 
     lib.hostbuf_file_reader_cleanup.argtypes = []
+    if hasattr(lib, "hostbuf_file_reader_cleanup_checked"):
+        lib.hostbuf_file_reader_cleanup_checked.argtypes = []
+        lib.hostbuf_file_reader_cleanup_checked.restype = ctypes.c_bool
 
     lib.hostbuf_register.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
     lib.hostbuf_register.restype = ctypes.c_bool
@@ -100,7 +103,11 @@ def read_file_to_device(file_obj, file_offset, size, stream, device_ptr, device,
 
 
 def cleanup_file_reader():
-    lib.hostbuf_file_reader_cleanup()
+    checked = getattr(lib, "hostbuf_file_reader_cleanup_checked", None)
+    if checked is None:
+        lib.hostbuf_file_reader_cleanup()
+    elif not checked():
+        raise RuntimeError("file reader completion failed; staging retained")
 
 
 class HostBuffer:

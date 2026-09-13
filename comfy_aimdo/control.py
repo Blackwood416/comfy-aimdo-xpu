@@ -787,6 +787,9 @@ def get_xpu_vmm_stats():
         "retire_queue_identity_mismatches",
         "retire_fence_query_failures",
         "retire_shutdown_wait_failures",
+        "asynchronous_host_to_device_calls",
+        "asynchronous_host_to_device_bytes",
+        "host_buffer_wait_failures",
     )
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_get_vmm_stats(values, len(names)):

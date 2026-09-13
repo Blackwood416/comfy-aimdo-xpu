@@ -37,6 +37,8 @@ static bool aimdo_stream_reclaim_trace_enabled(void) {
 
 static bool hostbuf_file_reader_retire_active(void) {
     HostbufFileReaderSlot *slot;
+    CUevent event = NULL;
+    CUresult recorded;
 
     if (g_devctx->_hostbuf_file_reader_active < 0) {
         return true;
@@ -47,20 +49,30 @@ static bool hostbuf_file_reader_retire_active(void) {
         return true;
     }
     if (slot->event) {
-        log(AIMDO_LOG_ERROR, "%s: active slot %d already has a completion event\n", __func__,
-            g_devctx->_hostbuf_file_reader_active);
+        // A failed reuse/cleanup leaves this slot retired and retryable.
+        return true;
+    }
+    if (!CHECK_CU(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING))) {
         return false;
     }
-    return CHECK_CU(cuEventCreate(&slot->event, CU_EVENT_DISABLE_TIMING)) &&
-           CHECK_CU(cuEventRecord(slot->event, (CUstream)slot->stream));
+#if defined(AIMDO_XPU)
+    recorded = aimdo_xpu_record_reader_event(event, slot->buffer);
+#else
+    recorded = cuEventRecord(event, (CUstream)slot->stream);
+#endif
+    if (!CHECK_CU(recorded)) {
+        CHECK_CU(cuEventDestroy(event));
+        return false;
+    }
+    slot->event = event;
+    return true;
 }
 
 static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
     HostbufFileReaderSlot *slot;
+    int next = (g_devctx->_hostbuf_file_reader_active + 1) % HOSTBUF_FILE_READER_SLOTS;
 
-    g_devctx->_hostbuf_file_reader_active =
-        (g_devctx->_hostbuf_file_reader_active + 1) % HOSTBUF_FILE_READER_SLOTS;
-    slot = &g_devctx->_hostbuf_file_reader_slots[g_devctx->_hostbuf_file_reader_active];
+    slot = &g_devctx->_hostbuf_file_reader_slots[next];
 
     if (slot->buffer && slot->event) {
         if (!CHECK_CU(cuEventSynchronize(slot->event)) ||
@@ -77,6 +89,7 @@ static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
 
     slot->offset = 0;
     slot->stream = (CUstream)stream;
+    g_devctx->_hostbuf_file_reader_active = next;
     return slot;
 }
 
@@ -98,7 +111,7 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             &g_devctx->_hostbuf_file_reader_slots[g_devctx->_hostbuf_file_reader_active];
         size_t chunk;
 
-        if (!slot || slot->stream != (CUstream)stream ||
+        if (!slot || slot->event || slot->stream != (CUstream)stream ||
             (slot->offset + size >= HOSTBUF_FILE_READER_WINDOW &&
              slot->offset >= LEAD_IN_THRESHOLD)) {
             if (!hostbuf_file_reader_retire_active() ||
@@ -152,6 +165,9 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
         CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)device_ptr,
                                                  slot->buffer + slot->offset,
                                                  chunk, (CUstream)stream);
+        // A failed submission can still own its source. Reserve the slice
+        // until the slot's completion token has been checked on reuse.
+        slot->offset += chunk;
         if (!CHECK_CU(copy_result)) {
             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
                 __func__, (int)copy_result, (void *)(uintptr_t)device_ptr, device,
@@ -159,7 +175,6 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             return false;
         }
 
-        slot->offset += chunk;
         file_offset += chunk;
         device_ptr += chunk;
         size -= chunk;
@@ -169,24 +184,42 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
 }
 
 SHARED_EXPORT
-void hostbuf_file_reader_cleanup(void) {
+bool hostbuf_file_reader_cleanup_checked(void) {
+    bool complete = true;
     if (!g_devctx) {
-        return;
+        return true;
     }
 
-    hostbuf_file_reader_retire_active();
+    if (!hostbuf_file_reader_retire_active()) {
+        return false;
+    }
     for (unsigned i = 0; i < HOSTBUF_FILE_READER_SLOTS; i++) {
         HostbufFileReaderSlot *slot = &g_devctx->_hostbuf_file_reader_slots[i];
 
         if (slot->buffer && slot->event) {
-            CHECK_CU(cuEventSynchronize(slot->event));
-            CHECK_CU(cuEventDestroy(slot->event));
+            if (!CHECK_CU(cuEventSynchronize(slot->event))) {
+                complete = false;
+                continue;
+            }
+            if (!CHECK_CU(cuEventDestroy(slot->event))) {
+                complete = false;
+                continue;
+            }
+            slot->event = NULL;
         }
-        if (slot->buffer) {
-            CHECK_CU(cuMemFreeHost(slot->buffer));
+        if (slot->buffer && !CHECK_CU(cuMemFreeHost(slot->buffer))) {
+            complete = false;
+            continue;
+        }
+        memset(slot, 0, sizeof(*slot));
+        if ((int)i == g_devctx->_hostbuf_file_reader_active) {
+            g_devctx->_hostbuf_file_reader_active = -1;
         }
     }
-    memset(g_devctx->_hostbuf_file_reader_slots, 0,
-           sizeof(g_devctx->_hostbuf_file_reader_slots));
-    g_devctx->_hostbuf_file_reader_active = -1;
+    return complete;
+}
+
+SHARED_EXPORT
+void hostbuf_file_reader_cleanup(void) {
+    (void)hostbuf_file_reader_cleanup_checked();
 }
