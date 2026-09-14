@@ -10,6 +10,13 @@
 typedef int cudaError_t;
 typedef struct CUstream_st *cudaStream_t;
 
+/* WDDM can require substantially more progress residency than the allocation
+ * that first crosses the sampled budget.  Use one shared Windows/XPU floor for
+ * both VBAR allocation retry and synchronous file-to-VBAR copy pressure. */
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#define AIMDO_XPU_WDDM_RECLAIM_FLOOR (512ULL << 20)
+#endif
+
 #if defined(__HIP_PLATFORM_AMD__) && !defined(_WIN32) && !defined(_WIN64)
 #include <sys/mman.h>
 /* Work around ROCm VMM unmap behavior by reprotecting the range after unmap.
@@ -135,8 +142,8 @@ void aimdo_log(int level, const char *file, int line, const char *format, ...);
 
 #define do_log(do_shot_counter, level, ...) {                                                   \
     static _Thread_local uint64_t _sc_;                                                         \
-    if ((!log_level || log_level >= (level)) && _sc_ < log_shot_counter) {                      \
-        _sc_ = (do_shot_counter) ? log_shot_counter : 0;                                        \
+    if ((!log_level || log_level >= (level)) && (!do_shot_counter || _sc_ < log_shot_counter)) { \
+        if (do_shot_counter) _sc_ = log_shot_counter;                                           \
         aimdo_log((level), __FILE__, __LINE__, __VA_ARGS__);                                    \
     }                                                                                           \
 }
@@ -223,21 +230,46 @@ fail:
     return err;
 }
 
+/* vrambuf.c */
+#if defined(__HIP_PLATFORM_AMD__) && defined(_WIN32)
+bool va_pool_init(void);
+void va_pool_cleanup(void);
+#else
+static inline bool va_pool_init(void) { return true; }
+static inline void va_pool_cleanup(void) {}
+#endif
+
 /* model_vbar.c */
 size_t vbars_free(ssize_t size);
 SHARED_EXPORT
 uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-/* dispatch.cpp: retirement epochs for queue-free reclaim */
-uint64_t aimdo_xpu_retire_epoch_current(void);
-uint64_t aimdo_xpu_retired_epoch(void);
-void aimdo_xpu_register_queue(void *queue);
+/* dispatch.cpp: per-queue retirement tokens for non-blocking reclaim */
+bool aimdo_xpu_register_consumer_queue(void *queue, int device);
+uint64_t aimdo_xpu_retire_token_current(void *queue, int device);
+size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
+                                 bool force_submit);
 /* model_vbar.c */
 size_t vbars_free_retired(ssize_t size);
+size_t vbars_free_all_retired(void);
+bool aimdo_xpu_copy_residency_poll(bool wait);
+void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
+SHARED_EXPORT
+bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
+                                   uint64_t size, uint64_t stream);
+SHARED_EXPORT
+bool vbar_consumer_acquire(void *devctx, void *vbar, uint64_t offset,
+                           uint64_t size, uint32_t kind);
+SHARED_EXPORT
+int vbar_consumer_release(void *devctx, void *vbar, uint64_t offset,
+                          uint64_t size, uint32_t kind, uint64_t stream);
+SHARED_EXPORT
+void vbar_get_page_states(void *devctx, void *vbar, uint64_t *out,
+                          size_t max_pages);
 #endif
 
 /* pyt-cu-alloc.c */
@@ -251,8 +283,14 @@ int aimdo_cuda_malloc_async(CUdeviceptr *devPtr, size_t size, CUstream hStream,
 int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
                           CUresult (*true_cuMemFreeAsync)(CUdeviceptr, CUstream));
 
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
+bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
+bool malloc_graph_sync_paused(void);
+
 bool allocations_init(void);
 void allocations_cleanup(void);
+void allocations_lock(void);
+void allocations_unlock(void);
 void allocations_analyze(bool only_dirty);
 SHARED_EXPORT
 void aimdo_analyze(void *devctx);

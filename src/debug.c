@@ -1,6 +1,7 @@
 #include "plat.h"
 
 #include <stdarg.h>
+#include <string.h>
 
 int log_level;
 
@@ -13,6 +14,19 @@ void set_log_callback(AimdoLogCallback callback) {
     log_callback = callback;
 }
 
+/* __FILE__ is embedded as the absolute source path at compile time, so the
+ * logs would leak the build machine's directory layout. Keep only the file
+ * name in the log prefix (e.g. "model-vbar.c:1399:ERROR:..."). */
+static const char *log_basename(const char *file) {
+    if (!file) {
+        return "?";
+    }
+    const char *back = strrchr(file, '\\');
+    const char *slash = strrchr(file, '/');
+    const char *last = (back && back > slash) ? back : slash;
+    return last ? last + 1 : file;
+}
+
 void aimdo_log(int level, const char *file, int line, const char *format, ...) {
     char message[2048];
     int prefix_length;
@@ -20,7 +34,7 @@ void aimdo_log(int level, const char *file, int line, const char *format, ...) {
     va_list args;
 
     prefix_length = snprintf(message, sizeof(message), "aimdo: %s:%d:%s:",
-                             file, line, get_level_str(level));
+                             log_basename(file), line, get_level_str(level));
     if (prefix_length < 0) {
         return;
     }

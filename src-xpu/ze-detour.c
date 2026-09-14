@@ -14,10 +14,10 @@
  * so it is no longer the default.
  *
  * Everything reached from these hooks must be non-blocking. A hook body runs
- * inside the driver's allocation call, and the compute queue it would wait on
- * may be blocked behind work that needs the very residency being requested.
- * aimdo_xpu_prepare_allocation() therefore reclaims only VBAR pages that are
- * provably retired and returns immediately otherwise.
+ * inside the native allocator stack, and re-entering Level Zero virtual-memory
+ * management there can race UMF/WDDM even after the lower allocation returned.
+ * aimdo_xpu_prepare_allocation() therefore records pressure only; an ensuing
+ * VBAR/model-owner boundary performs the actual retired-page reclaim.
  */
 
 #include <ze_api.h>
@@ -50,10 +50,13 @@ extern void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device)
 extern void aimdo_xpu_note_native_release(void *ptr);
 extern bool aimdo_xpu_native_accounting_init(void);
 extern void aimdo_xpu_native_accounting_cleanup(void);
+extern void aimdo_xpu_ze_set_account_native(bool enabled);
 extern bool aimdo_xpu_tracer_install(void);
 extern void aimdo_xpu_tracer_remove(void);
 extern bool aimdo_xpu_ur_hook_install(void);
 extern void aimdo_xpu_ur_hook_remove(void);
+extern bool aimdo_xpu_copy_residency_install(void);
+extern void aimdo_xpu_copy_residency_remove(void);
 
 typedef ze_result_t (ZE_APICALL *PFN_zeMemAllocDevice)(
     ze_context_handle_t, const ze_device_mem_alloc_desc_t *, size_t, size_t,
@@ -115,10 +118,10 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
      * observed to corrupt driver state and surface later as
      * UR_RESULT_ERROR_DEVICE_LOST, with progressive slowdown beforehand.
      *
-     * Nothing requires reclaim to complete first: a Windows device allocation
-     * does not fail, WDDM demotes the excess instead. Reclaiming immediately
-     * after the driver call returns keeps steady-state usage bounded just as
-     * well, without ever re-entering the driver. */
+     * Nothing requires reclaim to complete first: WDDM normally demotes an
+     * over-budget Windows allocation. After the call returns, publish the
+     * resulting pressure; do not mutate VBAR mappings until the next owner
+     * boundary has left the allocator/UMF stack. */
     aimdo_xpu_sample_pressure(device, size);
 
     result = true_zeMemAllocDevice(context, descriptor, size, alignment,
@@ -132,10 +135,9 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
 
     if (result == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
         result == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) {
-        /* WDDM normally demotes an over-budget allocation instead of failing,
-         * so reaching this point means the driver could not place the request
-         * at all. The driver call has returned, so reclaiming here is not
-         * re-entrant. */
+        /* WDDM normally demotes an over-budget allocation instead of failing.
+         * Even here the enclosing allocator stack is active, so record the
+         * request for owner-side reclaim before the allocator retries. */
         aimdo_xpu_retry_allocation(device, size);
         result = true_zeMemAllocDevice(context, descriptor, size, alignment,
                                        device_handle, pointer);
@@ -264,6 +266,12 @@ bool aimdo_setup_hooks(void) {
         return true;
     }
 
+    if (!aimdo_xpu_copy_residency_install()) {
+        aimdo_log(kAimdoDetourLogError, __FILE__, __LINE__,
+                  "XPU VBAR copy completion tracking is unavailable\n");
+        return false;
+    }
+
     if (env_flag_enabled("AIMDO_XPU_DISABLE_ALLOCATION_HOOKS")) {
         aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                   "%s: allocation interception disabled by request; AIMDO "
@@ -299,12 +307,16 @@ bool aimdo_setup_hooks(void) {
         aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                   "%s: Unified Runtime arbitration disabled by request; using "
                   "post-allocation Level Zero reclaim\n", __func__);
+        aimdo_xpu_ze_set_account_native(true);
     } else {
         g_ur_hook_owns_arbitration = aimdo_xpu_ur_hook_install();
         if (!g_ur_hook_owns_arbitration) {
             aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                       "%s: Unified Runtime arbitration unavailable; falling "
                       "back to post-allocation Level Zero reclaim\n", __func__);
+            aimdo_xpu_ze_set_account_native(true);
+        } else {
+            aimdo_xpu_ze_set_account_native(false);
         }
     }
 
@@ -321,6 +333,7 @@ void aimdo_teardown_hooks(void) {
     if (!g_hooks_installed) {
         return;
     }
+    aimdo_xpu_copy_residency_remove();
     if (g_tracer_owns_hooks) {
         aimdo_xpu_tracer_remove();
         g_tracer_owns_hooks = false;
@@ -334,6 +347,7 @@ void aimdo_teardown_hooks(void) {
     if (g_ur_hook_owns_arbitration) {
         aimdo_xpu_ur_hook_remove();
         g_ur_hook_owns_arbitration = false;
+        aimdo_xpu_ze_set_account_native(true);
     }
     g_hooks_installed = false;
 }

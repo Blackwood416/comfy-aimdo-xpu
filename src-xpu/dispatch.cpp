@@ -23,11 +23,15 @@ extern "C" {
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_account_allocation(int device, int64_t delta);
+#if defined(_WIN32) || defined(_WIN64)
+extern "C" bool aimdo_xpu_copy_residency_poll(bool wait);
+#endif
 extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped, unsigned *pin, uint64_t *page_index, uint64_t *unmapped_page, uint64_t *pages_spanned);
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -36,8 +40,25 @@ extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *m
 #define AIMDO_XPU_EXPORT __attribute__((visibility("default")))
 #endif
 
-struct CUevent_st {
+struct XpuCopyCompletion {
+    sycl::queue queue;
     sycl::event event;
+    // A failed submission may have enqueued work without returning its event.
+    bool wait_queue = false;
+
+    explicit XpuCopyCompletion(const sycl::queue &owner) : queue(owner) {}
+
+    void wait() {
+        if (wait_queue) {
+            queue.wait_and_throw();
+        } else {
+            event.wait_and_throw();
+        }
+    }
+};
+
+struct CUevent_st {
+    std::vector<XpuCopyCompletion> copies;
     bool recorded = false;
 };
 
@@ -84,10 +105,64 @@ enum XpuStat : size_t {
     kSmallVbarCopyFallbackCalls,
     kSmallVbarCopyFallbackBytes,
     kSmallVbarCopyFallbackFailures,
+    kRetireTokenCalls,
+    kRetireFenceSubmitCalls,
+    kRetireFenceCompleteCalls,
+    kRetireFenceSubmitFailures,
+    kRetireForcePolls,
+    kRetireTrackedQueues,
+    kRetireQueueRegistrationFailures,
+    kRetireQueueIdentityMismatches,
+    kRetireFenceQueryFailures,
+    kRetireShutdownWaitFailures,
+    kAsynchronousHostToDeviceCalls,
+    kAsynchronousHostToDeviceBytes,
+    kHostBufferWaitFailures,
     kXpuStatCount,
 };
 
 std::atomic<uint64_t> g_stats[kXpuStatCount];
+
+// Only cuMemAllocHost's three reader slots have a completion-controlled reuse
+// contract. Ordinary HostBuffer storage must retain synchronous copies.
+struct XpuReaderBuffer {
+    void *pointer;
+    size_t size;
+    std::mutex mutex;
+    bool releasing = false;
+    std::vector<XpuCopyCompletion> copies;
+
+    XpuReaderBuffer(void *address, size_t bytes) : pointer(address), size(bytes) {}
+};
+
+std::mutex g_reader_buffers_mutex;
+std::unordered_map<void *, std::shared_ptr<XpuReaderBuffer>> g_reader_buffers;
+
+bool async_reader_enabled() {
+#if defined(_WIN32) || defined(_WIN64)
+    static const bool enabled = [] {
+        const char *value = std::getenv("AIMDO_XPU_ASYNC_FILE_READER");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+std::shared_ptr<XpuReaderBuffer> reader_buffer_for(const void *source, size_t size) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(source);
+    std::lock_guard<std::mutex> guard(g_reader_buffers_mutex);
+    for (const auto &entry : g_reader_buffers) {
+        const auto &buffer = entry.second;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(buffer->pointer);
+        if (address >= base && address - base <= buffer->size &&
+            size <= buffer->size - (address - base)) {
+            return buffer;
+        }
+    }
+    return {};
+}
 
 struct XpuTorchBlock {
     void *pointer;
@@ -114,50 +189,51 @@ std::unordered_map<int, uint64_t> g_torch_reserved_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_active_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_reserved_bytes;
 
-// Retirement epochs.
-//
-// Torch's XPU queues are in-order, so a barrier submitted at reclaim time
-// waits for everything already queued.  That is precisely the whole-queue wait
-// that must never happen inside an allocation path.  A VBAR page is therefore
-// tagged with the current epoch when it is unpinned, which costs one atomic
-// read and submits nothing.  One bounded fence per completion interval then
-// publishes how far retirement has progressed, so reclaim only has to compare
-// two integers and never blocks.
+// VBAR retirement follows the same ownership rule as a caching allocator's
+// recordStream(): a page remembers only the queues that actually consumed it,
+// and each queue advances independently.  This avoids the old process-global
+// minimum epoch, where one unrelated/hidden queue both delayed every page and
+// forced a barrier onto every queue for every completion interval.
 std::mutex g_retire_mutex;
-std::atomic<uint64_t> g_retire_epoch{1};
-std::atomic<uint64_t> g_retired_epoch{0};
-std::atomic<bool> g_retire_pending{false};
 
-// A single outstanding fence is too coarse. On an in-order queue a fence only
-// completes after everything submitted before it, so one submitted late is
-// pessimistic: pages whose real last use finished long ago stay unprovable
-// because the fence is stuck behind unrelated work queued since. A small ring
-// keeps several finer-grained fences in flight, which bounds how far the
-// published retirement can lag without submitting one barrier per unpin.
+// Fences are deliberately batched.  Submitting one barrier per weight caused
+// thousands of live Level Zero events during long H3 cycles.  Sixty-four uses
+// amortizes submission while the force poll at real pressure closes a partial
+// batch, so reclaim does not depend on reaching the batch size.
 constexpr size_t kRetireFenceSlots = 8;
+constexpr size_t kRetireBatchUses = 64;
 
-// Torch hands out 32 round-robin queues per device pool, and a VBAR page can
-// be consumed on any of them. A barrier submitted to one queue orders nothing
-// on the others, so proving retirement from a single queue can release a page
-// whose real consumer is still running - observed as
-// UR_RESULT_ERROR_DEVICE_LOST. Every queue AIMDO has seen is therefore
-// fenced, and an epoch only retires once all of them have passed it.
-constexpr size_t kMaxTrackedQueues = 64;
-
-sycl::queue *g_tracked_queues[kMaxTrackedQueues];
-size_t g_tracked_queue_count = 0;
-// Set if more distinct queues appear than can be tracked. Retirement then
-// stops advancing, because an untracked queue cannot be proven idle.
-std::atomic<bool> g_retire_tracking_overflow{false};
+// The token format is shared with model-vbar.c through plat.h.  Queue tags are
+// one based so token zero remains the fail-closed "unknown queue" value.
+constexpr size_t kMaxTrackedQueues = AIMDO_XPU_RETIRE_MAX_QUEUES;
 
 struct RetireFence {
     sycl::event event;
-    uint64_t epoch = 0;
+    uint64_t generation = 0;
     bool valid = false;
 };
 
-// One fence ring per tracked queue.
-RetireFence g_retire_fences[kMaxTrackedQueues][kRetireFenceSlots];
+struct RetireQueue {
+    /* Keep a SYCL queue copy alive until every fence and every page token that
+     * names this slot has retired.  The Python/Torch stream pointer is only a
+     * lookup hint: it may be destroyed or reused after unpin. */
+    void *source_pointer = nullptr;
+    std::shared_ptr<sycl::queue> queue;
+    int device_id = -1;
+    ze_context_handle_t context = nullptr;
+    ze_device_handle_t device = nullptr;
+    uint64_t incarnation = 0;
+    uint64_t open_generation = 1;
+    uint64_t retired_generation = 0;
+    size_t pending_uses = 0;
+    RetireFence fences[kRetireFenceSlots];
+};
+
+RetireQueue g_retire_queues[kMaxTrackedQueues];
+size_t g_retire_queue_count = 0;
+std::atomic<bool> g_retire_tracking_overflow{false};
+std::atomic<bool> g_retire_accepting{false};
+uint64_t g_retire_incarnation_counter = 0;
 
 void increase_torch_bytes(std::unordered_map<int, uint64_t> &current,
                           std::unordered_map<int, uint64_t> &peak,
@@ -205,7 +281,7 @@ void trace_sync(const char *operation, const char *phase, uint64_t call,
 }
 
 extern "C" int aimdo_xpu_current_device(void);
-void aimdo_xpu_note_queue(sycl::queue *queue);
+void aimdo_xpu_note_queue(sycl::queue *queue, int expected_device);
 
 XpuDeviceState *find_device(int id) {
     auto found = std::find_if(
@@ -228,37 +304,84 @@ int device_from_native_handle(uintptr_t native_handle) {
     return found == g_devices.end() ? -1 : found->id;
 }
 
-/* Register a queue AIMDO has seen so its work is covered by retirement fences.
- * Called from resolve_queue(), so any queue that faults, copies into or
- * consumes a VBAR page is tracked before that page can be reclaimed. */
-void aimdo_xpu_note_queue(sycl::queue *queue) {
-    if (!queue) {
-        return;
+size_t aimdo_xpu_note_queue_locked(sycl::queue *queue, int expected_device) {
+    if (!queue || !g_retire_accepting.load(std::memory_order_acquire)) {
+        return kMaxTrackedQueues;
     }
+
+    try {
+        if (queue->get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            g_stats[kRetireQueueIdentityMismatches].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
+        }
+        const ze_context_handle_t context =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                queue->get_context());
+        const ze_device_handle_t device =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                queue->get_device());
+        XpuDeviceState *state = find_device(expected_device);
+
+        if (!state || state->context != context || state->device != device) {
+            g_stats[kRetireQueueIdentityMismatches].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
+        }
+
+        for (size_t index = 0; index < g_retire_queue_count; ++index) {
+            RetireQueue &retire_queue = g_retire_queues[index];
+            if (retire_queue.source_pointer == queue && retire_queue.queue &&
+                retire_queue.device_id == expected_device &&
+                retire_queue.context == context &&
+                retire_queue.device == device &&
+                *retire_queue.queue == *queue) {
+                return index;
+            }
+        }
+        if (g_retire_queue_count >= kMaxTrackedQueues) {
+            // Cannot prove retirement on an untracked queue, so stop advancing
+            // pages that name it rather than guessing from a different queue.
+            if (!g_retire_tracking_overflow.exchange(
+                    true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[AIMDO XPU] tracked queue table full (%zu); VBAR "
+                             "pages on additional queues are non-reclaimable\n",
+                             kMaxTrackedQueues);
+                std::fflush(stderr);
+            }
+            return kMaxTrackedQueues;
+        }
+        const size_t index = g_retire_queue_count++;
+        RetireQueue &retire_queue = g_retire_queues[index];
+        if (g_retire_incarnation_counter >=
+            AIMDO_XPU_RETIRE_INCARNATION_MASK) {
+            g_retire_queue_count--;
+            g_stats[kRetireQueueRegistrationFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
+        }
+        retire_queue.source_pointer = queue;
+        retire_queue.queue = std::make_shared<sycl::queue>(*queue);
+        retire_queue.device_id = expected_device;
+        retire_queue.context = context;
+        retire_queue.device = device;
+        retire_queue.incarnation = ++g_retire_incarnation_counter;
+        g_stats[kRetireTrackedQueues].store(
+            g_retire_queue_count, std::memory_order_relaxed);
+        return index;
+    } catch (...) {
+        g_stats[kRetireQueueRegistrationFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return kMaxTrackedQueues;
+    }
+}
+
+/* Register a queue AIMDO has seen.  Page retirement itself is scoped to the
+ * queue token returned at unpin, not to this process-wide registry. */
+void aimdo_xpu_note_queue(sycl::queue *queue, int expected_device) {
     std::lock_guard<std::mutex> guard(g_retire_mutex);
-    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-        if (g_tracked_queues[index] == queue) {
-            return;
-        }
-    }
-    if (g_tracked_queue_count >= kMaxTrackedQueues) {
-        // Cannot prove retirement on an untracked queue, so stop advancing
-        // retirement rather than release a page that may be in use. This is
-        // recoverable: aimdo_xpu_retire_reset() clears it, and the table is
-        // only ever this large if Torch really used that many queues.
-        if (!g_retire_tracking_overflow.exchange(true, std::memory_order_relaxed)) {
-            std::fprintf(stderr,
-                         "[AIMDO XPU] tracked queue table full (%zu); VBAR "
-                         "reclaim is disabled until reinitialization\n",
-                         kMaxTrackedQueues);
-            std::fflush(stderr);
-        }
-        return;
-    }
-    g_tracked_queues[g_tracked_queue_count++] = queue;
-    // A page tagged before this queue existed has no fence covering the work
-    // this queue may already hold, so ask for one immediately.
-    g_retire_pending.store(true, std::memory_order_relaxed);
+    (void)aimdo_xpu_note_queue_locked(queue, expected_device);
 }
 
 sycl::queue *resolve_queue(CUstream stream) {
@@ -273,12 +396,12 @@ sycl::queue *resolve_queue(CUstream stream) {
             state->queue = queue;
             g_stats[kQueueRebindCalls].fetch_add(1, std::memory_order_relaxed);
         }
-        aimdo_xpu_note_queue(queue);
+        aimdo_xpu_note_queue(queue, state ? state->id : -1);
         return queue;
     }
     auto *state = current_device();
     if (state && state->queue) {
-        aimdo_xpu_note_queue(state->queue);
+        aimdo_xpu_note_queue(state->queue, state->id);
     }
     return state ? state->queue : nullptr;
 }
@@ -324,8 +447,7 @@ CUresult xpu_context_get_device(CUdevice *device) {
     return CUDA_SUCCESS;
 }
 
-CUresult xpu_context_synchronize() {
-    auto *state = current_device();
+CUresult xpu_synchronize_device_queues(XpuDeviceState *state) {
     if (!state) {
         return kCudaErrorUnknown;
     }
@@ -333,19 +455,32 @@ CUresult xpu_context_synchronize() {
         g_stats[kContextSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
     trace_sync("context", "begin", call, state->queue);
     try {
-        // Callers use this as "all device work has completed" before unmapping
-        // VBAR pages. Torch hands out many queues per device, so waiting only
-        // the current one can release a page still running elsewhere. Wait
-        // every queue AIMDO has seen.
-        state->queue->wait_and_throw();
+        std::vector<sycl::queue> queues;
+
+        /* Copy owned queue handles while holding the registry lock, then wait
+         * after releasing it.  Waiting while holding g_retire_mutex inverted
+         * the retire-lock/VBAR-lock order used by unpin and could deadlock a
+         * model boundary against a concurrent retirement submission. */
+        queues.emplace_back(*state->queue);
         {
             std::lock_guard<std::mutex> guard(g_retire_mutex);
-            for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-                if (g_tracked_queues[index] != state->queue) {
-                    g_tracked_queues[index]->wait_and_throw();
+            for (size_t index = 0; index < g_retire_queue_count; ++index) {
+                const RetireQueue &retire_queue = g_retire_queues[index];
+                if (retire_queue.queue &&
+                    retire_queue.device_id == state->id &&
+                    *retire_queue.queue != *state->queue) {
+                    queues.emplace_back(*retire_queue.queue);
                 }
             }
         }
+        for (sycl::queue &queue : queues) {
+            queue.wait_and_throw();
+        }
+#if defined(_WIN32) || defined(_WIN64)
+        if (!aimdo_xpu_copy_residency_poll(true)) {
+            return kCudaErrorUnknown;
+        }
+#endif
         g_stats[kContextSyncCompletions].fetch_add(
             1, std::memory_order_relaxed);
         trace_sync("context", "end", call, state->queue);
@@ -354,6 +489,10 @@ CUresult xpu_context_synchronize() {
         trace_sync("context", "error", call, state->queue);
         return kCudaErrorUnknown;
     }
+}
+
+CUresult xpu_context_synchronize() {
+    return xpu_synchronize_device_queues(current_device());
 }
 
 CUresult xpu_device_get(CUdevice *device, int ordinal) {
@@ -503,10 +642,46 @@ CUresult xpu_host_alloc(void **pointer, size_t size) {
      * moving it 56 seconds earlier. Keep pageable staging until the copy
      * failure itself is understood. */
     *pointer = std::malloc(size);
-    return *pointer ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
+    if (!*pointer) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    if (async_reader_enabled()) {
+        try {
+            auto buffer = std::make_shared<XpuReaderBuffer>(*pointer, size);
+            std::lock_guard<std::mutex> guard(g_reader_buffers_mutex);
+            g_reader_buffers.emplace(*pointer, std::move(buffer));
+        } catch (...) {
+            std::free(*pointer);
+            *pointer = nullptr;
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    return CUDA_SUCCESS;
 }
 
 CUresult xpu_host_free(void *pointer) {
+    if (pointer && async_reader_enabled()) {
+        auto buffer = reader_buffer_for(pointer, 0);
+        if (!buffer || buffer->pointer != pointer) {
+            return kCudaErrorUnknown;
+        }
+        std::lock_guard<std::mutex> guard(buffer->mutex);
+        buffer->releasing = true;
+        try {
+            // Also covers failed/missing event recording and an active slot
+            // at cleanup. Never free staging whose completion is unproven.
+            for (auto &copy : buffer->copies) {
+                copy.wait();
+            }
+        } catch (...) {
+            g_stats[kHostBufferWaitFailures].fetch_add(1, std::memory_order_relaxed);
+            return kCudaErrorUnknown;
+        }
+        {
+            std::lock_guard<std::mutex> registry_guard(g_reader_buffers_mutex);
+            g_reader_buffers.erase(pointer);
+        }
+    }
     std::free(pointer);
     return CUDA_SUCCESS;
 }
@@ -577,6 +752,14 @@ CUresult xpu_physical_create(CUmemGenericAllocationHandle *handle, size_t size,
             reinterpret_cast<uintptr_t>(physical));
         g_stats[kPhysicalCreateCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kPhysicalCreateBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zePhysicalMemCreate failed: ze_result=0x%x "
+            "context=%p device=%p size=%zu page_size=%zu\n",
+            static_cast<unsigned int>(result), state->context, state->device,
+            size, page_size);
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -596,6 +779,20 @@ CUresult xpu_virtual_map(CUdeviceptr pointer, size_t size, size_t offset,
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kMapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kMapBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        size_t page_size = 0;
+        const ze_result_t query_result = zeVirtualMemQueryPageSize(
+            state->context, state->device, size, &page_size);
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zeVirtualMemMap failed: ze_result=0x%x "
+            "context=%p device=%p handle=%p address=%p size=%zu "
+            "offset=%zu page_size=%zu page_query_result=0x%x\n",
+            static_cast<unsigned int>(result), state->context, state->device,
+            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)),
+            reinterpret_cast<void *>(pointer), size, offset, page_size,
+            static_cast<unsigned int>(query_result));
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -616,6 +813,14 @@ CUresult xpu_virtual_unmap(CUdeviceptr pointer, size_t size) {
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kUnmapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kUnmapBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zeVirtualMemUnmap failed: ze_result=0x%x "
+            "context=%p address=%p size=%zu\n",
+            static_cast<unsigned int>(result), state->context,
+            reinterpret_cast<void *>(pointer), size);
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -631,6 +836,14 @@ CUresult xpu_physical_release(CUmemGenericAllocationHandle handle) {
             static_cast<uintptr_t>(handle)));
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kPhysicalReleaseCalls].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zePhysicalMemDestroy failed: ze_result=0x%x "
+            "context=%p handle=%p\n",
+            static_cast<unsigned int>(result), state->context,
+            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)));
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -641,11 +854,39 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
     if (!queue) {
         return kCudaErrorUnknown;
     }
-    const uint64_t call = g_stats[kSynchronousHostToDeviceCalls].fetch_add(
+    const auto buffer = async_reader_enabled() ? reader_buffer_for(source, size)
+                                               : nullptr;
+    const bool asynchronous = buffer && queue->is_in_order();
+    const char *operation = asynchronous ? "h2d_async" : "h2d";
+    const uint64_t call = g_stats[asynchronous ? kAsynchronousHostToDeviceCalls
+                                             : kSynchronousHostToDeviceCalls].fetch_add(
                               1, std::memory_order_relaxed) +
                           1;
-    trace_sync("h2d", "begin", call, queue, size);
+    trace_sync(operation, "begin", call, queue, size);
     try {
+        if (asynchronous) {
+            std::lock_guard<std::mutex> guard(buffer->mutex);
+            if (buffer->releasing) {
+                return kCudaErrorUnknown;
+            }
+            auto found = std::find_if(buffer->copies.begin(), buffer->copies.end(),
+                [queue](const XpuCopyCompletion &copy) { return copy.queue == *queue; });
+            if (found == buffer->copies.end()) {
+                // Allocate tracking before submission so even an exception
+                // cannot leave a live copy with no staging/queue owner.
+                buffer->copies.emplace_back(*queue);
+                found = buffer->copies.end() - 1;
+            }
+            found->wait_queue = true;
+            found->event = queue->memcpy(reinterpret_cast<void *>(destination), source, size);
+            found->wait_queue = false;
+            // On an in-order queue the newest event covers all earlier uses
+            // of this slot. Retain each distinct queue until slot cleanup.
+            g_stats[kHostToDeviceBytes].fetch_add(size, std::memory_order_relaxed);
+            g_stats[kAsynchronousHostToDeviceBytes].fetch_add(size, std::memory_order_relaxed);
+            trace_sync(operation, "submitted", call, queue, size);
+            return CUDA_SUCCESS;
+        }
         // XPU phase 1 uses ordinary malloc-backed host buffers rather than
         // pinned host allocations. Keep their lifetime unambiguous across
         // ComfyUI workflow boundaries: complete the copy before the common
@@ -667,7 +908,7 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
          * pieces before giving up. */
         constexpr size_t kSplitChunk = 8ULL * 1024 * 1024;
 
-        if (size > kSplitChunk) {
+        if (!asynchronous && size > kSplitChunk) {
             try {
                 const auto *bytes = static_cast<const unsigned char *>(source);
                 for (size_t done = 0; done < size; done += kSplitChunk) {
@@ -788,12 +1029,40 @@ CUresult xpu_event_record(CUevent event, CUstream stream) {
     if (!event || !queue) {
         return kCudaErrorUnknown;
     }
-    // All XPU host-to-device copies are completed synchronously above. The
-    // CUDA-shaped event retained by the common file-reader is therefore an
-    // already-completed token; submitting a long-lived SYCL barrier here can
-    // retain a worker queue beyond one ComfyUI workflow.
-    event->recorded = true;
-    return CUDA_SUCCESS;
+    try {
+        event->recorded = false;
+        event->copies.clear();
+        event->copies.emplace_back(*queue);
+        event->copies.back().event = queue->ext_oneapi_submit_barrier();
+        event->recorded = true;
+        return CUDA_SUCCESS;
+    } catch (...) {
+        return kCudaErrorUnknown;
+    }
+}
+
+CUresult xpu_reader_event_record(CUevent event, void *pointer) {
+    if (!event) {
+        return kCudaErrorUnknown;
+    }
+    try {
+        event->recorded = false;
+        event->copies.clear();
+        if (async_reader_enabled()) {
+            const auto buffer = reader_buffer_for(pointer, 0);
+            if (!buffer || buffer->pointer != pointer) {
+                return kCudaErrorUnknown;
+            }
+            std::lock_guard<std::mutex> guard(buffer->mutex);
+            event->copies = buffer->copies;
+        }
+        // Snapshot the slot's actual copy owners instead of dereferencing a
+        // Torch stream pointer that may have died since its last reader use.
+        event->recorded = true;
+        return CUDA_SUCCESS;
+    } catch (...) {
+        return kCudaErrorUnknown;
+    }
 }
 
 CUresult xpu_event_synchronize(CUevent event) {
@@ -803,6 +1072,15 @@ CUresult xpu_event_synchronize(CUevent event) {
     const uint64_t call =
         g_stats[kEventSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
     trace_sync("event", "begin", call, nullptr);
+    try {
+        for (auto &copy : event->copies) {
+            copy.wait();
+        }
+    } catch (...) {
+        g_stats[kHostBufferWaitFailures].fetch_add(1, std::memory_order_relaxed);
+        trace_sync("event", "error", call, nullptr);
+        return kCudaErrorUnknown;
+    }
     g_stats[kEventSyncCompletions].fetch_add(
         1, std::memory_order_relaxed);
     trace_sync("event", "end", call, nullptr);
@@ -917,8 +1195,8 @@ void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
     if (!pointer) {
         // A pending cached block is safer to wait here than letting the XPU
         // runtime enter an asynchronous OOM/device-lost state. Retry once
-        // after returning every idle block and evicting another request-size
-        // tranche of unpinned model pages.
+        // after returning every idle block and publishing another request-size
+        // tranche for owner-side VBAR reclaim.
         release_cached_torch_blocks(device, true);
         if (!aimdo_xpu_retry_allocation(device, size)) {
             return nullptr;
@@ -1095,7 +1373,81 @@ CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
 #endif
 }
 
+void poll_retire_queue_locked(RetireQueue &retire_queue) {
+    for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+        RetireFence &fence = retire_queue.fences[slot];
+        if (!fence.valid) {
+            continue;
+        }
+        bool complete = false;
+        try {
+            complete = fence.event.get_info<
+                sycl::info::event::command_execution_status>() ==
+                sycl::info::event_command_status::complete;
+        } catch (...) {
+            g_stats[kRetireFenceQueryFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!complete) {
+            continue;
+        }
+        retire_queue.retired_generation = std::max(
+            retire_queue.retired_generation, fence.generation);
+        fence.valid = false;
+        fence.event = sycl::event();
+        fence.generation = 0;
+        g_stats[kRetireFenceCompleteCalls].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+bool submit_retire_fence_locked(RetireQueue &retire_queue) {
+    if (!retire_queue.queue || retire_queue.pending_uses == 0) {
+        return true;
+    }
+
+    size_t free_slot = kRetireFenceSlots;
+    for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+        if (!retire_queue.fences[slot].valid) {
+            free_slot = slot;
+            break;
+        }
+    }
+    if (free_slot == kRetireFenceSlots) {
+        return false;
+    }
+
+    // Hold g_retire_mutex while submitting and advance the generation only
+    // after the barrier exists.  A concurrent unpin can therefore receive
+    // either the generation ordered by this barrier or the next generation,
+    // never a token whose fence was already submitted before its operator.
+    try {
+        sycl::event event =
+            retire_queue.queue->ext_oneapi_submit_barrier();
+        RetireFence &fence = retire_queue.fences[free_slot];
+        fence.event = std::move(event);
+        fence.generation = retire_queue.open_generation;
+        fence.valid = true;
+        retire_queue.open_generation++;
+        retire_queue.pending_uses = 0;
+        g_stats[kRetireFenceSubmitCalls].fetch_add(
+            1, std::memory_order_relaxed);
+        return true;
+    } catch (...) {
+        // Leave the generation open and all pages carrying it
+        // non-reclaimable. A later pressure poll may retry safely.
+        g_stats[kRetireFenceSubmitFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
 }  // namespace
+
+extern "C" CUresult aimdo_xpu_record_reader_event(CUevent event, void *buffer) {
+    return xpu_reader_event_record(event, buffer);
+}
 
 extern "C" {
 
@@ -1126,149 +1478,160 @@ void aimdo_xpu_record_native_release(size_t size) {
         size, std::memory_order_relaxed);
 }
 
-/* Tag a page that has just stopped being used.  This must stay cheap: it is
- * called once per weight per model pass and deliberately submits nothing.
- *
- * It also registers the caller's current queue. VBAR map/unmap go through the
- * Level Zero virtual-memory calls, which carry no stream argument, so this is
- * the only point where the queue that actually consumed the page is visible.
- * ComfyUI can fault and consume weights on a non-default stream, and a fence
- * on the default queue alone does not order that work. */
-uint64_t aimdo_xpu_retire_epoch_current(void) {
-    auto *state = current_device();
-    if (state && state->queue) {
-        aimdo_xpu_note_queue(state->queue);
+/* Return a token for the actual queue that consumed a VBAR page.  Tokens from
+ * the same queue share one generation until a bounded batch is closed. */
+bool aimdo_xpu_register_consumer_queue(void *queue_pointer, int device) {
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!queue) {
+        return false;
     }
-    g_retire_pending.store(true, std::memory_order_relaxed);
-    return g_retire_epoch.load(std::memory_order_relaxed);
-}
 
-/* Register the queue that consumed a VBAR page, named by the caller. */
-void aimdo_xpu_register_queue(void *queue) {
-    aimdo_xpu_note_queue(reinterpret_cast<sycl::queue *>(queue));
-}
-
-/* Publish how far retirement has progressed, without ever blocking.
- *
- * Publish how far retirement has progressed, without ever blocking.
- *
- * One fence per tracked queue is outstanding at a time, so a busy model pass
- * costs one barrier per queue per completion interval rather than one per
- * unpin.  A page whose epoch is at or below the returned value had its last
- * use submitted before a fence that has already completed on every queue
- * AIMDO has seen, so it can be unmapped immediately. */
-uint64_t aimdo_xpu_retired_epoch(void) {
     std::lock_guard<std::mutex> guard(g_retire_mutex);
-    const uint64_t published = g_retired_epoch.load(std::memory_order_relaxed);
-    const bool wanted =
-        g_retire_pending.exchange(false, std::memory_order_relaxed);
-    // An epoch is retired only once every tracked queue has passed it, so the
-    // result is the minimum across queues. A queue with no completed fence
-    // holds the published value back, which is the safe direction.
-    uint64_t retired = UINT64_MAX;
-    bool missed_a_fence = false;
-    uint64_t fence_epoch = 0;
-
-    if (g_tracked_queue_count == 0 ||
-        g_retire_tracking_overflow.load(std::memory_order_relaxed)) {
-        return published;
-    }
-
-    if (wanted) {
-        // Close the current epoch *before* submitting any barrier. A page is
-        // tagged in unpin after its operator was submitted, so a barrier
-        // queued after the epoch is closed is guaranteed to sit behind the
-        // work of every page carrying that epoch.
-        //
-        // Incrementing afterwards, as this did, left a window where a page
-        // could be tagged with an epoch whose barrier had already been
-        // submitted. Its work was then queued behind that barrier, yet the
-        // barrier completing marked it retired, and reclaim unmapped a page
-        // that was still in flight: the H2D copy into it failed with
-        // result=999 and the device was lost shortly after.
-        fence_epoch = g_retire_epoch.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-        RetireFence *ring = g_retire_fences[index];
-        uint64_t queue_retired = published;
-        size_t free_slot = kRetireFenceSlots;
-
-        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
-            RetireFence &fence = ring[slot];
-            if (!fence.valid) {
-                if (free_slot == kRetireFenceSlots) {
-                    free_slot = slot;
-                }
-                continue;
-            }
-            if (event_is_complete(fence.event)) {
-                // Each queue is in order, so a completed fence also proves
-                // every earlier fence on that same queue completed.
-                if (fence.epoch > queue_retired) {
-                    queue_retired = fence.epoch;
-                }
-                fence.valid = false;
-                fence.event = sycl::event();
-                if (free_slot == kRetireFenceSlots) {
-                    free_slot = slot;
-                }
-            }
-        }
-
-        if (wanted) {
-            if (free_slot >= kRetireFenceSlots) {
-                // Ring full: this queue gets no fence for the current epoch,
-                // so the request must survive to the next poll. Dropping it
-                // would leave the last pages of a pass unprovable forever.
-                missed_a_fence = true;
-            } else {
-                try {
-                    ring[free_slot].epoch = fence_epoch;
-                    ring[free_slot].event =
-                        g_tracked_queues[index]->ext_oneapi_submit_barrier();
-                    ring[free_slot].valid = true;
-                } catch (...) {
-                    missed_a_fence = true;
-                }
-            }
-        }
-
-        if (queue_retired < retired) {
-            retired = queue_retired;
-        }
-    }
-
-    if (missed_a_fence) {
-        // A queue carries no barrier for the closed epoch, so ask again. The
-        // epoch itself stays closed: reusing it would reintroduce the window
-        // this ordering exists to remove.
-        g_retire_pending.store(true, std::memory_order_relaxed);
-    }
-    if (retired == UINT64_MAX) {
-        retired = published;
-    }
-    if (retired > published) {
-        g_retired_epoch.store(retired, std::memory_order_relaxed);
-    }
-    return retired;
+    return aimdo_xpu_note_queue_locked(queue, device) < kMaxTrackedQueues;
 }
 
-/* Drop every outstanding fence. Called before the SYCL context is torn down so
- * no event outlives the queue it was submitted to. */
-void aimdo_xpu_retire_reset(void) {
-    std::lock_guard<std::mutex> guard(g_retire_mutex);
-    for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
-        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
-            g_retire_fences[index][slot].valid = false;
-            g_retire_fences[index][slot].event = sycl::event();
-            g_retire_fences[index][slot].epoch = 0;
-        }
-        g_tracked_queues[index] = nullptr;
+/* Model-owner completion boundary, never an allocator callback. Torch's
+ * device-wait shortcut can miss unsubmitted SYCL command-list batches.
+ * Register the caller's current queue before reusing the owned queue waits
+ * already used by VBAR release. The registry lock is not held while waiting. */
+AIMDO_XPU_EXPORT bool xpu_synchronize_queues(
+    int device, uint64_t queue_pointer) {
+    auto *state = find_device(device);
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!state || !queue ||
+        !aimdo_xpu_register_consumer_queue(queue, device)) {
+        return false;
     }
-    g_tracked_queue_count = 0;
-    g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
-    g_retire_pending.store(false, std::memory_order_relaxed);
+    return xpu_synchronize_device_queues(state) == CUDA_SUCCESS;
+}
+
+uint64_t aimdo_xpu_retire_token_current(void *queue_pointer, int device) {
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!queue) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    const size_t index = aimdo_xpu_note_queue_locked(queue, device);
+    if (index >= kMaxTrackedQueues) {
+        return 0;
+    }
+
+    RetireQueue &retire_queue = g_retire_queues[index];
+    poll_retire_queue_locked(retire_queue);
+    if (retire_queue.open_generation >
+        AIMDO_XPU_RETIRE_GENERATION_MASK) {
+        g_stats[kRetireFenceSubmitFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return 0;
+    }
+    const uint64_t stamp =
+        (retire_queue.incarnation << AIMDO_XPU_RETIRE_GENERATION_BITS) |
+        (retire_queue.open_generation & AIMDO_XPU_RETIRE_GENERATION_MASK);
+    const uint64_t token =
+        (stamp << AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) |
+        (index + 1);
+    if (retire_queue.pending_uses < kRetireBatchUses) {
+        retire_queue.pending_uses++;
+    }
+    g_stats[kRetireTokenCalls].fetch_add(1, std::memory_order_relaxed);
+    if (retire_queue.pending_uses >= kRetireBatchUses) {
+        (void)submit_retire_fence_locked(retire_queue);
+    }
+    return token;
+}
+
+/* Snapshot independently completed generations.  Normal unpin batching never
+ * waits. A force poll is used only by an owner-side pressure scan and closes
+ * partial batches so a later retry can reclaim them. */
+size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
+                                 bool force_submit) {
+    if (!completed || count == 0) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    if (force_submit) {
+        g_stats[kRetireForcePolls].fetch_add(1, std::memory_order_relaxed);
+    }
+    const size_t copied = std::min(count, g_retire_queue_count);
+    for (size_t index = 0; index < g_retire_queue_count; ++index) {
+        RetireQueue &retire_queue = g_retire_queues[index];
+        poll_retire_queue_locked(retire_queue);
+        if (force_submit && retire_queue.pending_uses) {
+            (void)submit_retire_fence_locked(retire_queue);
+        }
+        if (index < copied) {
+            completed[index] =
+                (retire_queue.incarnation <<
+                 AIMDO_XPU_RETIRE_GENERATION_BITS) |
+                (retire_queue.retired_generation &
+                 AIMDO_XPU_RETIRE_GENERATION_MASK);
+        }
+    }
+    for (size_t index = copied; index < count; ++index) {
+        completed[index] = 0;
+    }
+    return copied;
+}
+
+/* Drop every outstanding fence before the SYCL context is torn down. */
+bool aimdo_xpu_retire_reset(void) {
+    std::vector<sycl::queue> queues;
+    bool drained = true;
+
+    /* Prevent a late unpin from creating a token after the teardown snapshot.
+     * Queue copies keep the native handles alive until every submitted use has
+     * drained; event objects are destroyed only after those waits. */
+    g_retire_accepting.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> guard(g_retire_mutex);
+        queues.reserve(g_retire_queue_count);
+        for (size_t index = 0; index < g_retire_queue_count; ++index) {
+            if (g_retire_queues[index].queue) {
+                queues.emplace_back(*g_retire_queues[index].queue);
+            }
+        }
+    }
+    for (sycl::queue &queue : queues) {
+        try {
+            queue.wait_and_throw();
+        } catch (...) {
+            /* Keep the old registry and its queue ownership alive. Reusing a
+             * slot after a failed drain could let a new completion satisfy an
+             * old page token. */
+            g_stats[kRetireShutdownWaitFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            drained = false;
+        }
+    }
+    if (!drained) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_retire_mutex);
+        for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
+            RetireQueue &retire_queue = g_retire_queues[index];
+            for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+                retire_queue.fences[slot].valid = false;
+                retire_queue.fences[slot].event = sycl::event();
+                retire_queue.fences[slot].generation = 0;
+            }
+            retire_queue.source_pointer = nullptr;
+            retire_queue.queue.reset();
+            retire_queue.device_id = -1;
+            retire_queue.context = nullptr;
+            retire_queue.device = nullptr;
+            retire_queue.incarnation = 0;
+            retire_queue.open_generation = 1;
+            retire_queue.retired_generation = 0;
+            retire_queue.pending_uses = 0;
+        }
+        g_retire_queue_count = 0;
+        g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
+        g_stats[kRetireTrackedQueues].store(0, std::memory_order_relaxed);
+    }
+    return true;
 }
 
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(
@@ -1330,6 +1693,11 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
     if (!device_ids || !queue_pointers || count == 0) {
         return false;
     }
+    /* A re-init must drain and detach the old queue/context registry before
+     * replacing device identities. */
+    if (!aimdo_xpu_retire_reset()) {
+        return false;
+    }
     try {
         std::lock_guard<std::mutex> guard(g_devices_mutex);
         g_devices.clear();
@@ -1363,6 +1731,7 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
             g_devices.push_back(
                 XpuDeviceState{device_ids[i], queue, context, device});
         }
+        g_retire_accepting.store(true, std::memory_order_release);
         return true;
     } catch (...) {
         g_devices.clear();
@@ -1569,11 +1938,12 @@ bool aimdo_cuda_runtime_init(void) {
     g_cuda.p_cuEventRecord = xpu_event_record;
     g_cuda.p_cuEventSynchronize = xpu_event_synchronize;
     g_cuda.p_cuDeviceGetLuid = xpu_device_get_luid;
+    g_retire_accepting.store(true, std::memory_order_release);
     return true;
 }
 
 void aimdo_cuda_runtime_cleanup(void) {
-    aimdo_xpu_retire_reset();
+    (void)aimdo_xpu_retire_reset();
     std::memset(&g_cuda, 0, sizeof(g_cuda));
 }
 

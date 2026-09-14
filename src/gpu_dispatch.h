@@ -4,6 +4,24 @@
 
 #include <stdbool.h>
 
+/* Windows/XPU VBAR retirement token layout. Queue tags are one based, leaving
+ * token zero as an explicit unknown/fail-closed dependency. */
+#define AIMDO_XPU_RETIRE_MAX_QUEUES 64
+#define AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS 7
+#define AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) - 1)
+/* Queue slots may be reused after a complete runtime teardown. Encode a
+ * registry incarnation separately from the per-queue fence generation so an
+ * old page token can never be satisfied by a new queue occupying that slot. */
+#define AIMDO_XPU_RETIRE_GENERATION_BITS 33
+#define AIMDO_XPU_RETIRE_GENERATION_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_GENERATION_BITS) - 1)
+#define AIMDO_XPU_RETIRE_INCARNATION_BITS \
+    (64 - AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS - \
+     AIMDO_XPU_RETIRE_GENERATION_BITS)
+#define AIMDO_XPU_RETIRE_INCARNATION_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_INCARNATION_BITS) - 1)
+
 typedef CUresult (CUDAAPI *PFN_cuInit)(unsigned int flags);
 typedef CUresult (CUDAAPI *PFN_cuGetProcAddress)(const char *symbol, void **pfn, int cudaVersion,
                                                  cuuint64_t flags,
@@ -89,6 +107,12 @@ typedef struct AimdoCudaDispatch {
 } AimdoCudaDispatch;
 
 extern AimdoCudaDispatch g_cuda;
+
+#if defined(AIMDO_XPU)
+/* The reader owns staging, so its completion token must follow those copies,
+ * not a potentially expired Python stream pointer. */
+CUresult aimdo_xpu_record_reader_event(CUevent event, void *buffer);
+#endif
 
 typedef CUresult (CUDAAPI *PFN_deviceGetProperties)(void *prop, CUdevice dev);
 

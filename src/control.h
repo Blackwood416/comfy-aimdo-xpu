@@ -36,21 +36,29 @@ typedef struct AimdoContext {
     uint64_t _extra_vram_headroom;
     uint64_t _malloc_async_clamp;
     uint64_t _total_vram_usage;
+    /* Windows XPU allocation/copy callbacks cannot safely unmap VBAR pages
+     * from inside the runtime call stack.  They publish the largest observed
+     * shortage here; the model owner consumes it at the next VBAR boundary. */
+    int64_t _vbar_reclaim_requested;
     uint64_t _total_vram_last_check;
     ssize_t _deficit_sync;
     uint64_t _control_timestamp_last_check;
     void *_highest_priority; /* ModelVBAR * */
     void *_lowest_priority; /* ModelVBAR * */
+    void *_vbar_lock; /* Mutex; protects VBAR lists and resident-page state */
     bool _vbars_dirty;
     bool _allocations_dirty;
     bool _integrated_device;
     VramBuffer *_vmm_table[VMM_HASH_SIZE];
     SizeEntry *_size_table[SIZE_HASH_SIZE];
     void *_size_table_lock;
+    void *_rogues;
+    void *_rogue_candidates;
     HostbufFileReaderSlot _hostbuf_file_reader_slots[HOSTBUF_FILE_READER_SLOTS];
     int _hostbuf_file_reader_active;
 #if defined(__HIP_PLATFORM_AMD__) && defined(_WIN32)
     VramBuffer *_va_pool;
+    void *_va_pool_lock;
 #endif
 #if defined(_WIN32) || defined(_WIN64)
     void *_wddm_adapter; /* IDXGIAdapter3* */
@@ -67,6 +75,7 @@ static inline void set_devctx(AimdoContext *devctx) {
 
 bool set_devctx_for_device(int device_id);
 bool set_devctx_for_current_cuda_device(void);
+AimdoContext *aimdo_devctx_at(size_t index);
 
 #define vram_capacity               (g_devctx->_vram_capacity)
 #if (defined(_WIN32) || defined(_WIN64)) && defined(AIMDO_CUDA)
@@ -76,18 +85,23 @@ bool set_devctx_for_current_cuda_device(void);
 #define extra_vram_headroom         (g_devctx->_extra_vram_headroom)
 #define malloc_async_clamp          (g_devctx->_malloc_async_clamp)
 #define total_vram_usage            (g_devctx->_total_vram_usage)
+#define vbar_reclaim_requested      (g_devctx->_vbar_reclaim_requested)
 #define total_vram_last_check       (g_devctx->_total_vram_last_check)
 #define deficit_sync                (g_devctx->_deficit_sync)
 #define highest_priority_p          (*(ModelVBAR **)&g_devctx->_highest_priority)
 #define lowest_priority_p           (*(ModelVBAR **)&g_devctx->_lowest_priority)
+#define vbar_lock                    (g_devctx->_vbar_lock)
 #define vbars_dirty                 (g_devctx->_vbars_dirty)
 #define allocations_dirty           (g_devctx->_allocations_dirty)
 #define integrated_device           (g_devctx->_integrated_device)
 #define vmm_table                   (g_devctx->_vmm_table)
 #define size_table                  (g_devctx->_size_table)
 #define size_table_lock             (g_devctx->_size_table_lock)
+#define rogues                      (g_devctx->_rogues)
+#define global_rogue_candidates     (g_devctx->_rogue_candidates)
 #if defined(__HIP_PLATFORM_AMD__) && defined(_WIN32)
 #define va_pool                     (g_devctx->_va_pool)
+#define va_pool_lock                (g_devctx->_va_pool_lock)
 #endif
 #if defined(_WIN32) || defined(_WIN64)
 #define g_wddm_adapter              (*(IDXGIAdapter3 **)&g_devctx->_wddm_adapter)

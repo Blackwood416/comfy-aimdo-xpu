@@ -45,6 +45,9 @@ if lib is not None:
     lib.hostbuf_file_reader_read.restype = ctypes.c_bool
 
     lib.hostbuf_file_reader_cleanup.argtypes = []
+    if hasattr(lib, "hostbuf_file_reader_cleanup_checked"):
+        lib.hostbuf_file_reader_cleanup_checked.argtypes = []
+        lib.hostbuf_file_reader_cleanup_checked.restype = ctypes.c_bool
 
     lib.hostbuf_register.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
     lib.hostbuf_register.restype = ctypes.c_bool
@@ -74,8 +77,25 @@ def _device_stream_ptr(stream, device):
     return int(torch.xpu.current_stream(torch.device("xpu", int(device))).sycl_queue)
 
 
+def _prepare_xpu_copy(device, device_ptr, size):
+    # The native reader's last-resort pressure recovery can evict the whole
+    # retired VBAR working set. First offer the same live shortage to the
+    # existing rate-limited Torch cache recovery, on this owner-side stack.
+    # The destination already exists: querying with size again double-charges
+    # its storage. CPU-only reads and other backends retain their old path.
+    if (os.name != "nt" or control.implementation != "xpu"
+            or device is None or int(device) < 0 or not device_ptr or not size):
+        return
+    deficit = control.get_xpu_memory_deficit(int(device))
+    if deficit is not None and deficit > 0:
+        from .model_vbar import _release_native_cache
+
+        _release_native_cache(int(device))
+
+
 def read_file_to_device(file_obj, file_offset, size, stream, device_ptr, device, mark_cold=True):
     stream = _device_stream_ptr(stream, device)
+    _prepare_xpu_copy(device, device_ptr, size)
     if not lib.hostbuf_file_reader_read(int(device), _file_handle(file_obj),
                                         int(file_offset), int(size), int(stream) or None,
                                         int(device_ptr), bool(mark_cold)):
@@ -83,7 +103,11 @@ def read_file_to_device(file_obj, file_offset, size, stream, device_ptr, device,
 
 
 def cleanup_file_reader():
-    lib.hostbuf_file_reader_cleanup()
+    checked = getattr(lib, "hostbuf_file_reader_cleanup_checked", None)
+    if checked is None:
+        lib.hostbuf_file_reader_cleanup()
+    elif not checked():
+        raise RuntimeError("file reader completion failed; staging retained")
 
 
 class HostBuffer:
@@ -115,6 +139,7 @@ class HostBuffer:
     def read_file_slice(self, file_obj, file_offset, size, offset=0, stream=0, device_ptr=0, device=-1):
         device = -1 if device is None else int(device)
         stream = _device_stream_ptr(stream, device)
+        _prepare_xpu_copy(device, device_ptr, size)
         if not lib.hostbuf_read_file_slice(self._ptr, device, _file_handle(file_obj),
                                            int(file_offset), int(size), int(offset),
                                            int(stream) or None, int(device_ptr)):
