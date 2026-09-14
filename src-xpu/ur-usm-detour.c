@@ -773,6 +773,10 @@ static void test_reset_state(void) {
 }
 #endif
 
+void *aimdo_xpu_ur_loader(void) {
+    return (void *)resolve_ur_loader();
+}
+
 bool aimdo_xpu_ur_hook_install(void) {
     HMODULE loader;
     LONG status;

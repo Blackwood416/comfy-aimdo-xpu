@@ -29,6 +29,9 @@ extern "C" {
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_account_allocation(int device, int64_t delta);
+#if defined(_WIN32) || defined(_WIN64)
+extern "C" bool aimdo_xpu_copy_residency_poll(bool wait);
+#endif
 extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped, unsigned *pin, uint64_t *page_index, uint64_t *unmapped_page, uint64_t *pages_spanned);
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -473,6 +476,11 @@ CUresult xpu_synchronize_device_queues(XpuDeviceState *state) {
         for (sycl::queue &queue : queues) {
             queue.wait_and_throw();
         }
+#if defined(_WIN32) || defined(_WIN64)
+        if (!aimdo_xpu_copy_residency_poll(true)) {
+            return kCudaErrorUnknown;
+        }
+#endif
         g_stats[kContextSyncCompletions].fetch_add(
             1, std::memory_order_relaxed);
         trace_sync("context", "end", call, state->queue);

@@ -224,3 +224,66 @@ Disabling only `AIMDO_XPU_NATIVE_CACHE_TRIM` in the same configuration reduced
 the median to 37.71 seconds. Both miss the 25-second requirement. Keep these
 negative results when evaluating the reader bridge; do not treat the Krea2
 cache-recovery improvement as a universal H3 policy.
+
+The full H3 reader-overlap trial subsequently failed in its first step with
+an access violation during LoRA prefetch. The after-exception native snapshot
+does not identify the original fault instruction. Keep this route disabled
+by default; the bounded reader tests above do not establish pressure safety.
+
+Disabling the UR USM allocator (`UR_L0_DISABLE_USM_ALLOCATOR=1`) also failed
+the second Krea2 workflow with an access violation in `ze_intel_gpu64.dll`
+1.15.38308.0 at offset `0x308b4e`. The first workflow had a 2.45-second median;
+the second slowed to 5.2–5.5 seconds before failing. Keep the default UR pool.
+The ten-iteration CPU-reference recovery GEMM passed after this failure.
+
+## VMM sibling-copy residency lifetime
+
+A bounded two-page reproduction now isolates a missing ownership dependency.
+Page A's own consumer and retirement fence complete. A device copy into page B
+of the same reservation is then queued behind a warmed 12288-square BF16 GEMM.
+Reclaiming A before submitting the pending copy produces access violation
+`c0000005` at `ze_intel_gpu64.dll` 1.15.38308.0 offset `0x308b4e`, also observed
+in the Krea2 pressure failure. The probe uses less than 1 GiB, including only
+64 MiB of VBAR mappings; it does not allocate the budget requested to exercise
+reclaim. Waiting for B's copy before reclaim passes eight cycles on the same
+installation, and the recovery GEMM passed after the original failure.
+
+The Intel compute-runtime source at `9bc5aeb1faf4a13a2f13b1f595c51e47ea4ad289`
+explains the extra dependency: `CommandListCoreFamily::addVirtualReservationToResidency`
+adds all mapped siblings in a copy argument's virtual reservation to the
+command list. `Context::destroyPhysicalMem` destroys the graphics allocation.
+A per-page kernel fence alone therefore cannot protect the driver's pending
+copy residency list. The source reference is a diagnostic explanation, not a
+claim that this source revision built the installed driver.
+
+The Windows provider now observes existing UR 1D/2D copy and fill completions. A copy
+holds each touched VBAR reservation until its retained event completes; the
+source and destination are both covered. Normal owner reclaim polls without
+waiting. Existing synchronization boundaries drain copy owners too. Submission
+callbacks only acquire a metadata hold with try-lock and retain handles; they
+do not wait, unmap, or release VBAR ownership while inside the SYCL callback.
+Failed or partially submitted copies retain their hold until a successful
+owner-side queue wait. The allocation arbitration policy remains separate.
+
+The initial fixed two-page probe passed eight cycles, retained A while B's copy
+was pending, reclaimed A afterward, and checked every copied byte. Full
+The native hook regression, completion, budget, cache, reader and packaging
+group passed 54 tests, with one Linux-only skip. The real-device regression
+also passed eight normal and eight worker-thread cycles, checking all 512 MiB
+copied, preserving the pending copy's siblings, freeing an unrelated VBAR,
+and leaving zero pending completion owners. Full
+workflow acceptance is still required; these bounded results alone do not
+establish the Krea2/H3 performance or ClipProj reload result.
+
+## Rejected Krea2 SwiGLU gate expansion
+
+The `dg2.3` kernel trial with the Krea2 SwiGLU gate expanded to DG2 completed
+one cold workflow but failed after the next workflow's first step, at driver
+offset `0x308f1c`. The isolated complete FFN measurement also found an
+independent memory regression: for M4192/K6144/N16384, the original expression
+peaked at 302,596,608 bytes, while fusion peaked at 536,887,808 bytes (or
+415,236,096 with gate/up locals deleted). Three interleaved groups had original
+medians 21.931/21.770/21.907 ms and fused medians around 21.3–21.5 ms, with zero
+reference errors. That small speed difference does not justify the additional
+peak for this full-memory model. The plugin's original BMG-only gate is restored.
+This does not identify SwiGLU as the sole cause of the workflow access violation.

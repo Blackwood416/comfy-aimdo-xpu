@@ -58,6 +58,10 @@ static bool nvml_pressure;
 static AimdoContext *g_all_devctxs;
 static size_t g_all_devctx_count;
 
+AimdoContext *aimdo_devctx_at(size_t index) {
+    return index < g_all_devctx_count ? &g_all_devctxs[index] : NULL;
+}
+
 void hostbuf_file_reader_cleanup(void);
 
 SHARED_EXPORT

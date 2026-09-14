@@ -47,4 +47,12 @@ if errorlevel 1 exit /b 1
 "%BUILD_DIR%\ur_usm_detour_unit.exe"
 if errorlevel 1 exit /b 1
 
+cl.exe /nologo /O2 /MD /W3 /I"%DETOURS_INCLUDE%" ^
+    "%ROOT_DIR%\tests\windows_copy_residency_unit.c" ^
+    /Fo"%BUILD_DIR%\\" /Fe"%BUILD_DIR%\windows_copy_residency_unit.exe" ^
+    /link /LIBPATH:"%DETOURS_LIB_DIR%" detours.lib kernel32.lib
+if errorlevel 1 exit /b 1
+"%BUILD_DIR%\windows_copy_residency_unit.exe"
+if errorlevel 1 exit /b 1
+
 endlocal

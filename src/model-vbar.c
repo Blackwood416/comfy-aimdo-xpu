@@ -53,6 +53,7 @@ typedef struct ModelVBAR {
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
     uint64_t identity;
+    uint32_t copy_holds;
     uint8_t closing;
 #endif
 
@@ -514,7 +515,7 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
 
     do_free = do_free && vbar_page_is_mapped(rp) &&
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-              (do_unpin || (rp->pin_count == 0 && !rp->evicting &&
+              !mv->copy_holds && (do_unpin || (rp->pin_count == 0 && !rp->evicting &&
                             !rp->retire_unknown &&
                             !vbar_consumer_held(rp)));
 #else
@@ -687,6 +688,104 @@ static ModelVBAR *vbar_find_identity_locked(uint64_t identity) {
     return NULL;
 }
 
+static bool vbar_copy_overlaps(const ModelVBAR *mv, const void *pointer,
+                               size_t size) {
+    uint64_t address = (uint64_t)(uintptr_t)pointer;
+    uint64_t bytes = (uint64_t)mv->nr_pages * VBAR_PAGE_SIZE;
+    if (!size || !bytes) {
+        return false;
+    }
+    return address >= mv->vbar ? address - mv->vbar < bytes
+                              : mv->vbar - address < size;
+}
+
+/* UR callbacks only acquire a CPU ownership hold. They never wait for this
+ * lock, submit a fence, or change a physical mapping. A copy's residency list
+ * can contain every mapped sibling in each touched virtual reservation. */
+int aimdo_vbar_copy_acquire(const void *dst, size_t dst_size,
+                            const void *src, size_t src_size,
+                            uint64_t *identities, size_t capacity) {
+    size_t count = 0;
+    size_t locked = 0;
+    AimdoContext *saved = g_devctx;
+    AimdoContext *context;
+    int result = 0;
+
+    /* Copies may run on a Torch thread without AIMDO TLS, or cross devices.
+     * Lock contexts in their initialization order and restore caller TLS. */
+    while ((context = aimdo_devctx_at(locked))) {
+        if (context->_vbar_lock && !mutex_try_lock((Mutex)context->_vbar_lock)) {
+            result = -1;
+            goto unlock;
+        }
+        locked++;
+    }
+    for (size_t device = 0; device < locked; ++device) {
+        set_devctx(aimdo_devctx_at(device));
+        if (!highest_priority_p) {
+            continue;
+        }
+        for (ModelVBAR *mv = lowest_priority.higher;
+             mv && mv != &highest_priority; mv = mv->higher) {
+            if (!vbar_copy_overlaps(mv, dst, dst_size) &&
+                !vbar_copy_overlaps(mv, src, src_size)) {
+                continue;
+            }
+            if (mv->closing || mv->copy_holds == UINT32_MAX || count == capacity) {
+                result = -1;
+                goto rollback;
+            }
+            identities[count++] = mv->identity;
+            mv->copy_holds++;
+        }
+    }
+    result = (int)count;
+    goto unlock;
+
+rollback:
+    for (size_t device = 0; device < locked; ++device) {
+        set_devctx(aimdo_devctx_at(device));
+        if (!highest_priority_p) {
+            continue;
+        }
+        for (size_t index = 0; index < count; ++index) {
+            ModelVBAR *held = vbar_find_identity_locked(identities[index]);
+            if (held) {
+                held->copy_holds--;
+            }
+        }
+    }
+unlock:
+    while (locked) {
+        context = aimdo_devctx_at(--locked);
+        if (context->_vbar_lock) {
+            mutex_unlock((Mutex)context->_vbar_lock);
+        }
+    }
+    set_devctx(saved);
+    return result;
+}
+
+void aimdo_vbar_copy_release(const uint64_t *identities, size_t count) {
+    AimdoContext *saved = g_devctx;
+    AimdoContext *context;
+    for (size_t device = 0; (context = aimdo_devctx_at(device)); ++device) {
+        set_devctx(context);
+        if (!vbar_lock || !highest_priority_p) {
+            continue;
+        }
+        vbar_state_lock();
+        for (size_t index = 0; index < count; ++index) {
+            ModelVBAR *mv = vbar_find_identity_locked(identities[index]);
+            if (mv && mv->copy_holds) {
+                mv->copy_holds--;
+            }
+        }
+        vbar_state_unlock();
+    }
+    set_devctx(saved);
+}
+
 static void vbar_cancel_candidates(VbarEvictionCandidate *candidates,
                                    size_t count) {
     vbar_state_lock();
@@ -719,7 +818,7 @@ static size_t vbar_commit_candidates(VbarEvictionCandidate *candidates,
             continue;
         }
         ResidentPage *rp = &mv->residency_map[candidate->page_nr];
-        if (!rp->evicting || rp->pin_count || vbar_consumer_held(rp) ||
+        if (mv->copy_holds || !rp->evicting || rp->pin_count || vbar_consumer_held(rp) ||
             !vbar_page_is_mapped(rp) ||
             rp->handle != candidate->handle ||
             rp->serial != candidate->serial ||
@@ -759,7 +858,7 @@ static size_t vbar_freeze_retired_candidates(
         size_t floor;
         size_t page_nr;
 
-        if (mv == preserved) {
+        if (mv == preserved || mv->copy_holds) {
             continue;
         }
         floor = mv->watermark < mv->watermark_limit
@@ -1009,6 +1108,7 @@ size_t vbars_free_all_retired(void) {
     if (!vbar_async_reclaim_enabled()) {
         return 0;
     }
+    (void)aimdo_xpu_copy_residency_poll(false);
     completed_count = aimdo_xpu_retire_snapshot(
         completed, AIMDO_XPU_RETIRE_MAX_QUEUES, true);
     for (;;) {
@@ -1155,7 +1255,7 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
     one_time_setup();
     vbars_dirty = true;
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    mv->identity = ++vbar_identity_counter;
+    mv->identity = (uint64_t)InterlockedIncrement64((volatile LONG64 *)&vbar_identity_counter);
 #endif
     insert_vbar(mv);
     vbar_state_unlock();
@@ -1247,6 +1347,7 @@ void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
      */
     reclaim = budget_deficit((size_t)size);
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+    (void)aimdo_xpu_copy_residency_poll(false);
     {
         ssize_t requested = vbars_take_reclaim_request();
 
@@ -1590,6 +1691,7 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size,
 
     set_devctx((AimdoContext *)devctx);
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+    (void)aimdo_xpu_copy_residency_poll(false);
     (void)vbars_reclaim_at_owner_boundary(budget_deficit(0));
 #endif
     vbar_state_lock();
@@ -1884,7 +1986,7 @@ void vbar_free(void *devctx, void *vbar) {
     vbar_state_lock();
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
-        if (rp->pin_count || vbar_consumer_held(rp) ||
+        if (mv->copy_holds || rp->pin_count || vbar_consumer_held(rp) ||
             rp->retire_unknown) {
             log(AIMDO_LOG_ERROR,
                 "%s: VBAR %p page %zu still has an unknown/live consumer; "
@@ -1903,7 +2005,7 @@ void vbar_free(void *devctx, void *vbar) {
     vbars_dirty = true;
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
-        if (rp->pin_count || vbar_consumer_held(rp) ||
+        if (mv->copy_holds || rp->pin_count || vbar_consumer_held(rp) ||
             rp->retire_unknown) {
             log(AIMDO_LOG_ERROR,
                 "%s: VBAR %p page %zu changed during teardown; keeping it "

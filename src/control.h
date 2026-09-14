@@ -75,6 +75,7 @@ static inline void set_devctx(AimdoContext *devctx) {
 
 bool set_devctx_for_device(int device_id);
 bool set_devctx_for_current_cuda_device(void);
+AimdoContext *aimdo_devctx_at(size_t index);
 
 #define vram_capacity               (g_devctx->_vram_capacity)
 #if (defined(_WIN32) || defined(_WIN64)) && defined(AIMDO_CUDA)

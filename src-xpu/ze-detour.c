@@ -55,6 +55,8 @@ extern bool aimdo_xpu_tracer_install(void);
 extern void aimdo_xpu_tracer_remove(void);
 extern bool aimdo_xpu_ur_hook_install(void);
 extern void aimdo_xpu_ur_hook_remove(void);
+extern bool aimdo_xpu_copy_residency_install(void);
+extern void aimdo_xpu_copy_residency_remove(void);
 
 typedef ze_result_t (ZE_APICALL *PFN_zeMemAllocDevice)(
     ze_context_handle_t, const ze_device_mem_alloc_desc_t *, size_t, size_t,
@@ -264,6 +266,12 @@ bool aimdo_setup_hooks(void) {
         return true;
     }
 
+    if (!aimdo_xpu_copy_residency_install()) {
+        aimdo_log(kAimdoDetourLogError, __FILE__, __LINE__,
+                  "XPU VBAR copy completion tracking is unavailable\n");
+        return false;
+    }
+
     if (env_flag_enabled("AIMDO_XPU_DISABLE_ALLOCATION_HOOKS")) {
         aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
                   "%s: allocation interception disabled by request; AIMDO "
@@ -325,6 +333,7 @@ void aimdo_teardown_hooks(void) {
     if (!g_hooks_installed) {
         return;
     }
+    aimdo_xpu_copy_residency_remove();
     if (g_tracer_owns_hooks) {
         aimdo_xpu_tracer_remove();
         g_tracer_owns_hooks = false;
