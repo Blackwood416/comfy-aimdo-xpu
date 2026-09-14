@@ -24,7 +24,8 @@ static struct Pending pending[128];
 void aimdo_log(int level, const char *file, int line, const char *format, ...) {}
 bool set_devctx_for_device(int device) { g_devctx = &context; return device == 0; }
 bool poll_budget_deficit(const char **method) { *method = "test"; return true; }
-size_t vbars_free_all_retired(void) { return 0; }
+size_t vbars_free_retired(ssize_t size) { return 0; }
+bool aimdo_xpu_copy_residency_poll(bool wait) { return true; }
 void vbars_request_reclaim(ssize_t size) {}
 
 bool xfer_file_read(uint64_t handle, uint64_t offset, void *destination,

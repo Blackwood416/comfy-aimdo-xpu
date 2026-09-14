@@ -26,7 +26,8 @@ static DXGI_QUERY_VIDEO_MEMORY_INFO local_sample, nonlocal_sample;
 static size_t device_free;
 static unsigned sample_calls, memory_calls, log_calls, failures;
 static HRESULT local_result = S_OK;
-static size_t reclaimable_bytes, reclaim_calls;
+static size_t reclaimable_bytes, reclaim_calls, copy_polls;
+static ssize_t reclaim_target;
 static ssize_t requested_reclaim;
 
 #define MIB(value) ((uint64_t)(value) * 1024 * 1024)
@@ -42,12 +43,21 @@ void aimdo_log(int level, const char *file, int line, const char *format, ...) {
     ++log_calls;
 }
 
-size_t vbars_free_all_retired(void) {
-    size_t freed = reclaimable_bytes;
+bool aimdo_xpu_copy_residency_poll(bool wait) {
+    CHECK(!wait);
+    ++copy_polls;
+    return true;
+}
+
+size_t vbars_free_retired(ssize_t size) {
+    size_t pages = ((size_t)size + MIB(32) - 1) / MIB(32);
+    size_t freed = MIN(reclaimable_bytes, pages * MIB(32));
+    CHECK(copy_polls == reclaim_calls + 1);
     ++reclaim_calls;
+    reclaim_target = size;
     total_vram_usage -= freed;
-    reclaimable_bytes = 0;
-    return freed / (32 * 1024 * 1024);
+    reclaimable_bytes -= freed;
+    return pages - freed / MIB(32);
 }
 
 void vbars_request_reclaim(ssize_t size) { requested_reclaim = size; }
@@ -95,7 +105,8 @@ static void reset_case(void) {
     device_free = MIB(8192);
     sample_calls = memory_calls = 0;
     local_result = S_OK;
-    reclaimable_bytes = reclaim_calls = 0;
+    reclaimable_bytes = reclaim_calls = copy_polls = 0;
+    reclaim_target = 0;
     requested_reclaim = 0;
     test_tick = 10000;
 }
@@ -109,8 +120,9 @@ static void test_copy_uses_already_accounted_destination(void) {
     CHECK(budget_deficit(MIB(64)) == (ssize_t)MIB(48));
     AimdoXpuCopyPressure pressure = aimdo_xpu_prepare_h2d();
     CHECK(pressure.fit_deficit == -(ssize_t)MIB(16));
-    CHECK(pressure.reclaimed_pages == 0);
+    CHECK(pressure.remaining_pages == 0);
     CHECK(reclaim_calls == 0 && requested_reclaim == 0);
+    CHECK(copy_polls == 0);
     CHECK(total_vram_usage == MIB(15344));
 }
 
@@ -120,16 +132,29 @@ static void test_copy_still_recovers_from_live_pressure(void) {
     reclaimable_bytes = MIB(256);
     AimdoXpuCopyPressure pressure = aimdo_xpu_prepare_h2d();
     CHECK(pressure.fit_deficit == (ssize_t)MIB(64));
-    CHECK(pressure.reclaimed_pages == 8);
-    CHECK(pressure.post_reclaim_deficit == -(ssize_t)MIB(192));
+    CHECK(pressure.remaining_pages == 0);
+    CHECK(reclaimable_bytes == MIB(192));
+    CHECK(reclaim_target == (ssize_t)MIB(64));
+    CHECK(pressure.post_reclaim_deficit == 0);
     CHECK(reclaim_calls == 1 && requested_reclaim == 0);
 
     reset_case();
     total_vram_usage = local_sample.CurrentUsage = MIB(15424);
     pressure = aimdo_xpu_prepare_h2d();
-    CHECK(pressure.reclaimed_pages == 0);
+    CHECK(pressure.remaining_pages == 2);
     CHECK(pressure.post_reclaim_deficit == (ssize_t)MIB(64));
     CHECK(reclaim_calls == 1 && requested_reclaim == (ssize_t)MIB(64));
+
+    reset_case();
+    total_vram_usage = local_sample.CurrentUsage = MIB(15367);
+    reclaimable_bytes = MIB(12288);
+    pressure = aimdo_xpu_prepare_h2d();
+    CHECK(pressure.fit_deficit == (ssize_t)MIB(7));
+    CHECK(pressure.remaining_pages == 0);
+    CHECK(reclaim_target == (ssize_t)MIB(7));
+    CHECK(reclaimable_bytes == MIB(12256));
+    CHECK(pressure.post_reclaim_deficit == -(ssize_t)MIB(25));
+    CHECK(requested_reclaim == 0);
 }
 
 static void test_os_reservation_is_counted_once(void) {

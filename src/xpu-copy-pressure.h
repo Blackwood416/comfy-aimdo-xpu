@@ -7,7 +7,7 @@
 typedef struct AimdoXpuCopyPressure {
     ssize_t fit_deficit;
     ssize_t post_reclaim_deficit;
-    size_t reclaimed_pages;
+    size_t remaining_pages;
 } AimdoXpuCopyPressure;
 
 static inline AimdoXpuCopyPressure aimdo_xpu_prepare_h2d(void) {
@@ -16,9 +16,11 @@ static inline AimdoXpuCopyPressure aimdo_xpu_prepare_h2d(void) {
     pressure.fit_deficit = budget_deficit(0);
     pressure.post_reclaim_deficit = pressure.fit_deficit;
     if (pressure.fit_deficit > 0) {
-        /* Preserve the WDDM progress recovery for a real live shortage. Its
-         * non-blocking scan cannot select pinned or unfinished consumers. */
-        pressure.reclaimed_pages = vbars_free_all_retired();
+        /* A small shortage must not invalidate the entire model. Completed
+         * copy owners can now release sibling-page holds before the existing
+         * bounded reclaim selects pages whose consumers have retired. */
+        (void)aimdo_xpu_copy_residency_poll(false);
+        pressure.remaining_pages = vbars_free_retired(pressure.fit_deficit);
         pressure.post_reclaim_deficit = budget_deficit(0);
         if (pressure.post_reclaim_deficit > 0) {
             vbars_request_reclaim(pressure.post_reclaim_deficit);

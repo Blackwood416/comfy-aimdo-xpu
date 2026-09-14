@@ -86,7 +86,8 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
     assert '"post_reclaim_deficit=%lld\\n"' in windows_path
     assert "cuCtxSynchronize" not in windows_path
     policy = (Path(__file__).resolve().parents[1] / "src" / "xpu-copy-pressure.h").read_text(encoding="utf-8")
-    assert "vbars_free_all_retired();" in policy
+    assert "vbars_free_retired(pressure.fit_deficit);" in policy
+    assert "aimdo_xpu_copy_residency_poll(false);" in policy
     assert "vbars_request_reclaim(pressure.post_reclaim_deficit);" in policy
     assert "cuCtxSynchronize" not in policy
 

@@ -128,35 +128,19 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             return false;
         }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* This direct reader runs on the model-owner call stack, before the
-         * Level Zero copy is submitted.  The preceding VBAR fault has already
-         * mapped and pinned the destination, so a non-blocking scan cannot
-         * select it.  Reclaim other pages whose consumer fences are already
-         * complete now: deferring all of this pressure to the next fault can
-         * deadlock forward progress when the synchronous H2D wait itself is
-         * the operation that cannot complete under residency pressure.
-         *
-         * A live deficit can require additional room for WDDM progress:
-         * both 32 MiB and 512 MiB targeted reclaim completed, but the following
-         * SYCL copy still waited forever in urEventWait. Once a real shortage
-         * exists, use caching-allocator OOM semantics and flush every VBAR page
-         * whose recorded consumers are provably complete. Do not do this while
-         * there is no live deficit. The destination has already been counted
-         * by its allocation; adding chunk again would turn a harmless copy
-         * near the budget boundary into a full working-set eviction.
-         *
-         * Never wait here. Re-sample after the flush and preserve only a real
-         * remaining deficit for the next model-owner boundary. */
+        /* Reclaim the live shortage before submitting the copy. The VBAR
+         * destination is already accounted and pinned; pending copies also
+         * hold its siblings. The scan never waits for unfinished consumers. */
         if (!aimdo_stream_reclaim_disabled()) {
             AimdoXpuCopyPressure pressure = aimdo_xpu_prepare_h2d();
             if (aimdo_stream_reclaim_trace_enabled()) {
                 fprintf(stderr,
                         "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
-                        "size=%zu fit_deficit=%lld reclaimed_pages=%zu "
+                        "size=%zu fit_deficit=%lld remaining_pages=%zu "
                         "post_reclaim_deficit=%lld\n",
                         (void *)(uintptr_t)device_ptr, chunk,
                         (long long)pressure.fit_deficit,
-                        pressure.reclaimed_pages,
+                        pressure.remaining_pages,
                         (long long)pressure.post_reclaim_deficit);
                 fflush(stderr);
             }

@@ -253,6 +253,20 @@ bool aimdo_xpu_copy_residency_install(void) {
     if (copy_hook_attached) {
         return true;
     }
+    /* Opt-in. This hold keeps every mapped page of a touched VMM reservation
+     * non-reclaimable for as long as a copy naming that reservation is
+     * outstanding. Its bounded two-page reproduction is real, but on A770 the
+     * heavy streaming workflows keep such a hold alive almost continuously:
+     * with the hook installed MiniMax H3 0.4MP/124f fails in its first sampling
+     * step (UR_RESULT_ERROR_DEVICE_LOST) and Krea2+LoRA still needs the
+     * surrounding reclaim policy; with the hook absent from the same build H3
+     * completes all eight steps at 26.35 s and Krea2+LoRA completes eight of
+     * eight rounds at 1.65-1.70 s. The default path therefore omits the hook
+     * and the pressure scenario it was written for can request it explicitly. */
+    if (GetEnvironmentVariableA("AIMDO_XPU_ENABLE_COPY_RESIDENCY", NULL, 0) ==
+        0) {
+        return true;
+    }
     HMODULE loader = (HMODULE)aimdo_xpu_ur_loader();
     if (!loader) {
         return false;
