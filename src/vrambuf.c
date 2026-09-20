@@ -156,7 +156,28 @@ bool vrambuf_destroy(void *arg) {
     }
 
     if (buf->allocated > 0) {
+#if defined(AIMDO_XPU)
+        /* Level Zero on Windows/DG2 (driver 1.15.38308) does not reliably
+         * tear down every mapping when one zeVirtualMemUnmap spans several
+         * zeVirtualMemMap ranges. The reservation is then freed with stale
+         * mapped allocations behind it, and the next command that references
+         * a fresh reservation faults inside ze_intel_gpu64.dll (c0000005 at
+         * +0x308b4e; ComfyUI H3 round 2, LoRA-patch prefetch). Reproduced
+         * with results/omnixpu-takeover-20260913/probe_vrambuf_recycle.py:
+         * a 2+ chunk buffer crashes on the cycle after destroy, a 1 chunk
+         * buffer never does. Unmap exactly the ranges that were mapped. */
+        size_t offset = 0;
+        for (i = 0; i < buf->handle_count && offset < buf->allocated; i++) {
+            size_t chunk = buf->allocated - offset;
+            if (chunk > VRAM_CHUNK_SIZE) {
+                chunk = VRAM_CHUNK_SIZE;
+            }
+            CHECK_CU(cuMemUnmap(buf->base_ptr + offset, chunk));
+            offset += chunk;
+        }
+#else
         CHECK_CU(cuMemUnmap(buf->base_ptr, buf->allocated));
+#endif
         unmap_workaround(buf->base_ptr, buf->allocated);
     }
 

@@ -287,3 +287,25 @@ medians 21.931/21.770/21.907 ms and fused medians around 21.3–21.5 ms, with ze
 reference errors. That small speed difference does not justify the additional
 peak for this full-memory model. The plugin's original BMG-only gate is restored.
 This does not identify SwiGLU as the sole cause of the workflow access violation.
+
+## Cast-buffer reservation teardown on DG2
+
+ComfyUI's `reset_cast_buffers()` drops the per-stream `VRAMBuffer` at every
+node boundary, and `vrambuf_destroy()` then issued one `cuMemUnmap` covering
+the whole grown range before releasing the physical handles and freeing the
+reservation. Level Zero on Windows/DG2 (`ze_intel_gpu64.dll` 1.15.38308) does
+not tear down every mapping when one `zeVirtualMemUnmap` spans several
+`zeVirtualMemMap` ranges: the reservation is freed with stale mapped
+allocations behind it, and the next command that references a fresh
+reservation in that context faults at driver offset `0x308b4e`. In ComfyUI
+this is the MiniMax H3 + LoRA second-round access violation inside
+`read_file_to_device` during LoRA-patch prefetch; it needs the async prefetch
+streams only because they are what makes the cast buffer grow past one chunk.
+
+`tests/run_xpu_vrambuf_recycle.py` reproduces it without ComfyUI: create a
+`VRAMBuffer`, grow it by two or more 16 MiB chunks, copy into it, destroy it,
+repeat. With the single-range unmap the second cycle crashes on the first
+copy; a one-chunk buffer never does, and holding every buffer (no destroy)
+never does. `vrambuf_destroy()` now unmaps chunk by chunk on the XPU build, in
+the same ranges `vrambuf_grow()` mapped. Eight four-chunk cycles and six
+twelve-chunk cycles pass on A770 after the change.
