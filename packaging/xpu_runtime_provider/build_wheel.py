@@ -166,7 +166,7 @@ def _manifest(
         "provider_package": PROVIDER_PACKAGE,
         "canonical_distribution": {
             "name": CANONICAL_DISTRIBUTION,
-            "compatible_versions": [source_version],
+            "compatible_versions": sorted(set([source_version, "0.5.5", "0.5.6"])),
         },
         "canonical_import": CANONICAL_PACKAGE,
         "source": {
