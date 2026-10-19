@@ -164,7 +164,8 @@ DeviceGetNativeHandleFn real_device_get_native_handle() {
 
 bool is_oom(ur_result_t result) {
     return result == UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
-           result == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+           result == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY ||
+           result == UR_RESULT_ERROR_OUT_OF_RESOURCES;
 }
 
 bool retry_matches(
@@ -293,6 +294,9 @@ ur_result_t real_allocate_and_account(
         real(context, device, description, pool, size, pointer);
     if (is_oom(result)) {
         g_stats[kRuntimeOomCalls].fetch_add(1, std::memory_order_relaxed);
+        if (result == UR_RESULT_ERROR_OUT_OF_RESOURCES) {
+            return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
         return result;
     }
     if (result != UR_RESULT_SUCCESS) {
@@ -482,6 +486,9 @@ extern "C" ur_result_t urUSMDeviceAlloc(
         arm_retry(
             context, device, pool, size,
             RetryReason::kRuntimeOom, generation, aimdo_device);
+    }
+    if (result == UR_RESULT_ERROR_OUT_OF_RESOURCES) {
+        result = UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     return result;
 }

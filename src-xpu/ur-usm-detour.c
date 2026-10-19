@@ -52,6 +52,7 @@ typedef int ur_result_t;
 #define UR_RESULT_ERROR_UNINITIALIZED 37
 #define UR_RESULT_ERROR_OUT_OF_HOST_MEMORY 38
 #define UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY 39
+#define UR_RESULT_ERROR_OUT_OF_RESOURCES 40
 
 typedef void *ur_context_handle_t;
 typedef void *ur_device_handle_t;
@@ -463,7 +464,8 @@ static void arm_retry(ur_context_handle_t context, ur_device_handle_t device,
 
 static bool is_oom(ur_result_t result) {
     return result == UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
-           result == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+           result == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY ||
+           result == UR_RESULT_ERROR_OUT_OF_RESOURCES;
 }
 
 static ur_result_t allocate_and_account(
@@ -475,6 +477,9 @@ static ur_result_t allocate_and_account(
 
     if (is_oom(result)) {
         stat_add(kRuntimeOomCalls, 1);
+        if (result == UR_RESULT_ERROR_OUT_OF_RESOURCES) {
+            return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
         return result;
     }
     if (result != UR_RESULT_SUCCESS) {
