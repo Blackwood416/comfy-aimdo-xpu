@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_dispatch.h"
+#include "debug.h"
 
 /* NOTE: cuda_runtime.h is banned here. Always use the driver APIs.
  * Keep SDK headers out of this project and add any required duck-types
@@ -99,6 +100,7 @@ void *aimdo_find_loaded_module(const char *const *libraries, size_t library_coun
 #define cuMemUnmap                  g_cuda.p_cuMemUnmap
 #define cuMemRelease                g_cuda.p_cuMemRelease
 #define cuMemcpyHtoDAsync           g_cuda.p_cuMemcpyHtoDAsync
+#define cuMemcpyDtoHAsync           g_cuda.p_cuMemcpyDtoHAsync
 #define cuEventCreate               g_cuda.p_cuEventCreate
 #define cuEventDestroy              g_cuda.p_cuEventDestroy
 #define cuEventRecord               g_cuda.p_cuEventRecord
@@ -119,19 +121,6 @@ typedef unsigned long long ull;
 #define K 1024
 #define M (K * K)
 #define G (M * K)
-
-enum DebugLevels {
-    __NONE__ = -1,
-    /* Default to everything so if python itegration is hosed, we see prints. */
-    ALL = 0,
-    CRITICAL,
-    AIMDO_LOG_ERROR,
-    WARNING,
-    INFO,
-    DEBUG,
-    VERBOSE,
-    VVERBOSE,
-};
 
 /* debug.c */
 extern int log_level;
@@ -240,7 +229,10 @@ static inline void va_pool_cleanup(void) {}
 #endif
 
 /* model_vbar.c */
-size_t vbars_free(ssize_t size);
+bool vbars_free(ssize_t size);
+#ifdef AIMDO_XPU
+bool vbars_free_for_allocator(ssize_t size);
+#endif
 SHARED_EXPORT
 uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
@@ -256,7 +248,7 @@ size_t vbars_free_all_retired(void);
 bool aimdo_xpu_copy_residency_poll(bool wait);
 void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
-void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+bool vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
 SHARED_EXPORT
 bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
@@ -283,8 +275,27 @@ int aimdo_cuda_malloc_async(CUdeviceptr *devPtr, size_t size, CUstream hStream,
 int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
                           CUresult (*true_cuMemFreeAsync)(CUdeviceptr, CUstream));
 
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream, int *result);
 bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
+#ifdef AIMDO_XPU
+SHARED_EXPORT
+bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream, int *result);
+SHARED_EXPORT
+bool malloc_graph_test_fail_next_page_creates(unsigned attempts);
+SHARED_EXPORT
+bool malloc_graph_destroy_checked(void *handle);
+SHARED_EXPORT
+bool malloc_graph_destroy_terminal(void *handle);
+SHARED_EXPORT
+bool malloc_graph_test_fail_next_destroy_release(void *handle, unsigned stage);
+SHARED_EXPORT
+bool malloc_graph_test_arm_driver_release(void *handle, unsigned stage,
+                                        unsigned error_kind);
+SHARED_EXPORT
+bool aimdo_xpu_test_arm_vmm_release(unsigned stage, unsigned error_kind);
+SHARED_EXPORT
+unsigned aimdo_xpu_test_pending_vmm_release(void);
+#endif
 bool malloc_graph_sync_paused(void);
 
 bool allocations_init(void);

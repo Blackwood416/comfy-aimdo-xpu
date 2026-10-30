@@ -1,9 +1,9 @@
 #include "plat.h"
 
-/* The XPU allocator does not record or replay allocation graphs. Keep the
- * shared allocator/VBAR call sites on their ordinary allocation and
- * synchronization paths without linking the CUDA/HIP memory compiler. */
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+/* Linux links the shared compiler core. Windows retains the ordinary
+ * allocator route until its compiler build and lifetime contract are ported. */
+#if defined(_WIN32) || defined(_WIN64)
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream, int *result) {
     return false;
 }
 
@@ -18,6 +18,7 @@ bool malloc_graph_sync_paused(void) {
 bool free_rogue(CUdeviceptr ptr, int *result) {
     return false;
 }
+#endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
 bool aimdo_setup_hooks(void) {
@@ -75,7 +76,9 @@ bool aimdo_xpu_prepare_allocation(int device, size_t size) {
         vbars_request_reclaim(deficit);
     }
 #else
-    vbars_free(budget_deficit(size));
+    if (!vbars_free_for_allocator(budget_deficit(size))) {
+        return false;
+    }
 #endif
     return true;
 }
@@ -90,7 +93,9 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
     aimdo_wddm_force_poll();
     vbars_request_reclaim((ssize_t)size);
 #else
-    vbars_free((ssize_t)size);
+    if (!vbars_free_for_allocator((ssize_t)size)) {
+        return false;
+    }
 #endif
     return true;
 }
@@ -115,7 +120,9 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
          * request; the next VBAR fault drains it outside allocator locks. */
         vbars_request_reclaim((ssize_t)deficit);
 #else
-        vbars_free((ssize_t)deficit);
+        if (!vbars_free_for_allocator((ssize_t)deficit)) {
+        return false;
+    }
 #endif
     }
     return true;
