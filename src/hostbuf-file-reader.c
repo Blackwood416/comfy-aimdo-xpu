@@ -147,12 +147,7 @@ static bool hostbuf_file_transfer(int device, uint64_t file_handle, uint64_t fil
         }
 #endif
         CUresult copy_result = write ? cuMemcpyDtoHAsync(buffer, (CUdeviceptr)device_ptr, chunk, (CUstream)stream) :
-                                      cuMemcpyHtoDAsync((CUdeviceptr)device_ptr,
-                                                        slot->buffer + slot->offset,
-                                                        chunk, (CUstream)stream);
-        // A failed submission can still own its source. Reserve the slice
-        // until the slot's completion token has been checked on reuse.
-        slot->offset += chunk;
+                                      cuMemcpyHtoDAsync((CUdeviceptr)device_ptr, buffer, chunk, (CUstream)stream);
         if (!CHECK_CU(copy_result)) {
             log(AIMDO_LOG_ERROR, "%s: %s failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
                 __func__, write ? "cuMemcpyDtoHAsync" : "cuMemcpyHtoDAsync", (int)copy_result,
