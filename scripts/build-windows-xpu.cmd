@@ -135,7 +135,7 @@ icx-cl.exe /nologo -fsycl /LD /Fe:"%OUTPUT_PATH%" ^
     "%BUILD_DIR%\xpu-ze-tracer.obj" ^
     "%BUILD_DIR%\xpu-dispatch.obj" ^
     /link /LIBPATH:"%BUILD_DIR%" /LIBPATH:"%DETOURS_LIB_DIR%" ^
-    ze_loader.lib detours.lib dxgi.lib dxguid.lib onecore.lib setupapi.lib cfgmgr32.lib
+    ze_loader.lib detours.lib dxgi.lib dxguid.lib dxcore.lib onecore.lib setupapi.lib cfgmgr32.lib
 if errorlevel 1 exit /b 1
 
 echo built %OUTPUT_PATH%

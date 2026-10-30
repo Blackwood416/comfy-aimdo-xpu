@@ -545,8 +545,7 @@ CUresult xpu_context_get_device(CUdevice *device) {
     return CUDA_SUCCESS;
 }
 
-CUresult xpu_context_synchronize() {
-    const auto state = snapshot_current_device();
+CUresult xpu_synchronize_device_queues(XpuDeviceState *state) {
     if (!state) {
         return kCudaErrorUnknown;
     }
@@ -588,6 +587,10 @@ CUresult xpu_context_synchronize() {
         trace_sync("context", "error", call, state->queue.get());
         return kCudaErrorUnknown;
     }
+}
+
+CUresult xpu_context_synchronize() {
+    return xpu_synchronize_device_queues(current_device());
 }
 
 CUresult xpu_device_get(CUdevice *device, int ordinal) {
