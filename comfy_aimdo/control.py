@@ -742,6 +742,7 @@ def _init_device_contexts(requested, headrooms, queues, *, quiescent=False):
                 "PyTorch caching allocator retained"
             )
         if implementation == "xpu" and platform.system() == "Windows":
+            import torch
             _install_windows_xpu_completion_hooks(torch)
         return True
 
