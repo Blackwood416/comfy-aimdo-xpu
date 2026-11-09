@@ -734,6 +734,9 @@ static bool ur_hook_disabled_by_request(void) {
 static HMODULE resolve_ur_loader(void) {
     HMODULE proxy = find_module_by_name(L"ur_win_proxy_loader.dll");
     HMODULE by_name = GetModuleHandleA("ur_loader.dll");
+    if (!by_name) {
+        by_name = GetModuleHandleA("ur_loader_shared.dll");
+    }
     HMODULE from_proxy = NULL;
 
     if (proxy) {
