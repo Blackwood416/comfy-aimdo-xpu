@@ -69,7 +69,48 @@ typedef ur_result_t(__cdecl *PFN_urDeviceGetNativeHandle)(ur_device_handle_t,
 typedef ur_result_t(__cdecl *PFN_urPhysicalMemCreate)(ur_context_handle_t,
                                                       ur_device_handle_t, size_t,
                                                       const void *, void **);
+typedef ur_result_t(__cdecl *PFN_urGetProcAddrTable)(uint32_t, void *);
 typedef void *(__cdecl *PFN_getPreloadedURLib)(void);
+
+/* Minimal DDI table layouts matching unified-runtime/ur_ddi.h. Used when
+ * sycl9.dll (oneAPI 2026.2+) statically links the UR loader and dispatches
+ * straight into ur_adapter_level_zero[_v2].dll's DDI tables rather than
+ * calling ur_loader.dll!urUSMDeviceAlloc. */
+struct AimdoUrUsmDdiTable {
+    void *pfnHostAlloc;
+    PFN_urUSMDeviceAlloc pfnDeviceAlloc;
+    void *pfnSharedAlloc;
+    PFN_urUSMFree pfnFree;
+    void *pfnGetMemAllocInfo;
+    void *pfnPoolCreate;
+    void *pfnPoolRetain;
+    void *pfnPoolRelease;
+    void *pfnPoolGetInfo;
+};
+
+struct AimdoUrDeviceDdiTable {
+    void *pfnGet;
+    void *pfnGetInfo;
+    void *pfnRetain;
+    void *pfnRelease;
+    void *pfnPartition;
+    void *pfnSelectBinary;
+    PFN_urDeviceGetNativeHandle pfnGetNativeHandle;
+    void *pfnCreateWithNativeHandle;
+    void *pfnGetGlobalTimestamps;
+};
+
+struct AimdoUrPhysicalMemDdiTable {
+    PFN_urPhysicalMemCreate pfnCreate;
+    void *pfnRetain;
+    void *pfnRelease;
+    void *pfnGetInfo;
+};
+
+#define AIMDO_UR_API_VERSION_0_12 0x0000000cu
+#define AIMDO_UR_API_VERSION_0_11 0x0000000bu
+#define AIMDO_UR_API_VERSION_0_10 0x0000000au
+#define AIMDO_UR_API_VERSION_0_9  0x00000009u
 
 #if defined(__cplusplus)
 extern "C" {
@@ -139,6 +180,27 @@ static PFN_urUSMDeviceAlloc true_urUSMDeviceAlloc;
 static PFN_urUSMFree true_urUSMFree;
 static PFN_urPhysicalMemCreate true_urPhysicalMemCreate;
 static PFN_urDeviceGetNativeHandle real_urDeviceGetNativeHandle;
+
+/* Adapter-level hooks for oneAPI 2026.2+ (sycl9.dll statically links the UR
+ * loader and invokes ur_adapter_level_zero[_v2].dll's DDI table entries
+ * directly, bypassing ur_loader.dll). We attach to both the v1 and v2 Level
+ * Zero adapters when loaded; a per-thread nesting guard ensures that if an
+ * older sycl8.dll calls ur_loader.dll which then forwards into the adapter,
+ * arbitration and accounting run exactly once at the outermost entry. */
+#define MAX_UR_ADAPTER_SLOTS 2
+
+struct UrAdapterHookSlot {
+    bool attached;
+    PFN_urUSMDeviceAlloc true_alloc;
+    PFN_urUSMFree true_free;
+    PFN_urPhysicalMemCreate true_phys_create;
+    PFN_urDeviceGetNativeHandle get_native_handle;
+};
+
+static struct UrAdapterHookSlot g_adapter_slots[MAX_UR_ADAPTER_SLOTS];
+static __declspec(thread) int t_ur_hook_depth;
+static __declspec(thread) PFN_urUSMDeviceAlloc t_active_true_alloc;
+static __declspec(thread) PFN_urDeviceGetNativeHandle t_active_get_native_handle;
 
 static volatile LONG g_attached;
 static volatile LONG g_enabled;
@@ -427,11 +489,14 @@ static bool is_torch_native_segment_request(void) {
 
 static int resolve_device(ur_device_handle_t device) {
     ur_native_handle_t native = NULL;
+    PFN_urDeviceGetNativeHandle get_native =
+        t_active_get_native_handle ? t_active_get_native_handle
+                                   : real_urDeviceGetNativeHandle;
 
-    if (!real_urDeviceGetNativeHandle) {
+    if (!get_native) {
         return -1;
     }
-    if (real_urDeviceGetNativeHandle(device, &native) != UR_RESULT_SUCCESS) {
+    if (get_native(device, &native) != UR_RESULT_SUCCESS) {
         return -1;
     }
     return xpu_device_from_native_handle((uintptr_t)native);
@@ -478,12 +543,13 @@ static ur_result_t allocate_and_account(
     const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
     void **pointer, int aimdo_device) {
     ur_result_t result;
+    PFN_urUSMDeviceAlloc real_alloc =
+        t_active_true_alloc ? t_active_true_alloc : true_urUSMDeviceAlloc;
 
     /* Nested Level Zero hooks observe the underlying zeMemAllocDevice on this
      * thread; mark UR ownership so total_vram_usage is credited once here. */
     ++t_ur_accounting_depth;
-    result = true_urUSMDeviceAlloc(context, device, description, pool, size,
-                                   pointer);
+    result = real_alloc(context, device, description, pool, size, pointer);
     --t_ur_accounting_depth;
 
     if (is_oom(result)) {
@@ -522,14 +588,15 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
     bool caller_classified;
     bool torch_native_request;
     ur_result_t result;
+    PFN_urUSMDeviceAlloc real_alloc =
+        t_active_true_alloc ? t_active_true_alloc : true_urUSMDeviceAlloc;
 
-    if (!true_urUSMDeviceAlloc) {
+    if (!real_alloc) {
         return UR_RESULT_ERROR_UNINITIALIZED;
     }
     if (!InterlockedCompareExchange(&g_enabled, 0, 0)) {
         stat_add(kPassThroughAllocCalls, 1);
-        return true_urUSMDeviceAlloc(context, device, description, pool, size,
-                                     pointer);
+        return real_alloc(context, device, description, pool, size, pointer);
     }
 
     EnterCriticalSection(&g_hook_lock);
@@ -537,8 +604,7 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
         clear_retry();
         LeaveCriticalSection(&g_hook_lock);
         stat_add(kPassThroughAllocCalls, 1);
-        return true_urUSMDeviceAlloc(context, device, description, pool, size,
-                                     pointer);
+        return real_alloc(context, device, description, pool, size, pointer);
     }
 
     generation = InterlockedCompareExchange64(&g_generation, 0, 0);
@@ -547,8 +613,7 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
         clear_retry();
         LeaveCriticalSection(&g_hook_lock);
         stat_add(kUnknownDeviceCalls, 1);
-        return true_urUSMDeviceAlloc(context, device, description, pool, size,
-                                     pointer);
+        return real_alloc(context, device, description, pool, size, pointer);
     }
 
     if (!aimdo_xpu_allocation_deficit(aimdo_device, size, &deficit)) {
@@ -647,44 +712,77 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
 }
 
 /* Wrapper that times the whole hook, including the driver call it wraps. */
-static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
+static ur_result_t aimdo_urUSMDeviceAlloc_dispatch(
+    PFN_urUSMDeviceAlloc real_alloc, PFN_urDeviceGetNativeHandle get_native,
     ur_context_handle_t context, ur_device_handle_t device,
     const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
     void **pointer) {
     LARGE_INTEGER started;
     LARGE_INTEGER finished;
     ur_result_t result;
+    PFN_urUSMDeviceAlloc prev_alloc;
+    PFN_urDeviceGetNativeHandle prev_native;
 
+    if (!real_alloc) {
+        return UR_RESULT_ERROR_UNINITIALIZED;
+    }
+    if (t_ur_hook_depth > 0) {
+        return real_alloc(context, device, description, pool, size, pointer);
+    }
+
+    prev_alloc = t_active_true_alloc;
+    prev_native = t_active_get_native_handle;
+    t_active_true_alloc = real_alloc;
+    t_active_get_native_handle = get_native;
+    ++t_ur_hook_depth;
     QueryPerformanceCounter(&started);
     result = aimdo_urUSMDeviceAlloc_body(context, device, description, pool,
                                          size, pointer);
     QueryPerformanceCounter(&finished);
+    --t_ur_hook_depth;
+    t_active_true_alloc = prev_alloc;
+    t_active_get_native_handle = prev_native;
     stat_add(kAllocCalls, 1);
     InterlockedAdd64(&g_hook_ticks, finished.QuadPart - started.QuadPart);
     InterlockedIncrement64(&g_hook_calls);
     return result;
 }
 
-static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
-                                           void *pointer) {
+static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
+    ur_context_handle_t context, ur_device_handle_t device,
+    const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
+    void **pointer) {
+    return aimdo_urUSMDeviceAlloc_dispatch(
+        true_urUSMDeviceAlloc, real_urDeviceGetNativeHandle, context, device,
+        description, pool, size, pointer);
+}
+
+static ur_result_t aimdo_urUSMFree_dispatch(PFN_urUSMFree real_free,
+                                            ur_context_handle_t context,
+                                            void *pointer) {
     ur_result_t result;
     size_t size = 0;
     int device = -1;
 
-    if (!true_urUSMFree) {
+    if (!real_free) {
         return UR_RESULT_ERROR_UNINITIALIZED;
+    }
+    if (t_ur_hook_depth > 0) {
+        return real_free(context, pointer);
     }
     stat_add(kFreeCalls, 1);
     if (!InterlockedCompareExchange(&g_enabled, 0, 0)) {
-        return true_urUSMFree(context, pointer);
+        return real_free(context, pointer);
     }
 
     EnterCriticalSection(&g_hook_lock);
     if (!InterlockedCompareExchange(&g_enabled, 0, 0)) {
         LeaveCriticalSection(&g_hook_lock);
-        return true_urUSMFree(context, pointer);
+        return real_free(context, pointer);
     }
-    result = true_urUSMFree(context, pointer);
+    ++t_ur_hook_depth;
+    result = real_free(context, pointer);
+    --t_ur_hook_depth;
     if (result != UR_RESULT_SUCCESS) {
         LeaveCriticalSection(&g_hook_lock);
         return result;
@@ -709,16 +807,197 @@ static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
     return result;
 }
 
+static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
+                                           void *pointer) {
+    return aimdo_urUSMFree_dispatch(true_urUSMFree, context, pointer);
+}
+
 /* Counted, never arbitrated. PyTorch allocates through this entry point
  * instead of USM when expandable segments are enabled, in which case
  * urUSMDeviceAlloc is never called and AIMDO would otherwise be silently
  * blind. control.py refuses that configuration; this counter is what proves
  * the refusal is warranted. */
+static ur_result_t aimdo_urPhysicalMemCreate_dispatch(
+    PFN_urPhysicalMemCreate real_create, ur_context_handle_t context,
+    ur_device_handle_t device, size_t size, const void *properties,
+    void **handle) {
+    ur_result_t result;
+
+    if (!real_create) {
+        return UR_RESULT_ERROR_UNINITIALIZED;
+    }
+    if (t_ur_hook_depth > 0) {
+        return real_create(context, device, size, properties, handle);
+    }
+    stat_add(kPhysicalMemCreateCalls, 1);
+    ++t_ur_hook_depth;
+    result = real_create(context, device, size, properties, handle);
+    --t_ur_hook_depth;
+    return result;
+}
+
 static ur_result_t __cdecl aimdo_urPhysicalMemCreate(
     ur_context_handle_t context, ur_device_handle_t device, size_t size,
     const void *properties, void **handle) {
-    stat_add(kPhysicalMemCreateCalls, 1);
-    return true_urPhysicalMemCreate(context, device, size, properties, handle);
+    return aimdo_urPhysicalMemCreate_dispatch(
+        true_urPhysicalMemCreate, context, device, size, properties, handle);
+}
+
+#define DEFINE_UR_ADAPTER_THUNKS(SLOT)                                          \
+    static ur_result_t __cdecl aimdo_adapter_alloc_##SLOT(                      \
+        ur_context_handle_t context, ur_device_handle_t device,                 \
+        const ur_usm_desc_t *description, ur_usm_pool_handle_t pool,            \
+        size_t size, void **pointer) {                                          \
+        return aimdo_urUSMDeviceAlloc_dispatch(                                 \
+            g_adapter_slots[SLOT].true_alloc,                                   \
+            g_adapter_slots[SLOT].get_native_handle, context, device,           \
+            description, pool, size, pointer);                                  \
+    }                                                                           \
+    static ur_result_t __cdecl aimdo_adapter_free_##SLOT(                       \
+        ur_context_handle_t context, void *pointer) {                           \
+        return aimdo_urUSMFree_dispatch(g_adapter_slots[SLOT].true_free,        \
+                                        context, pointer);                      \
+    }                                                                           \
+    static ur_result_t __cdecl aimdo_adapter_phys_create_##SLOT(                \
+        ur_context_handle_t context, ur_device_handle_t device, size_t size,    \
+        const void *properties, void **handle) {                                \
+        return aimdo_urPhysicalMemCreate_dispatch(                              \
+            g_adapter_slots[SLOT].true_phys_create, context, device, size,      \
+            properties, handle);                                                \
+    }
+
+DEFINE_UR_ADAPTER_THUNKS(0)
+DEFINE_UR_ADAPTER_THUNKS(1)
+
+static const PFN_urUSMDeviceAlloc kAdapterAllocThunks[MAX_UR_ADAPTER_SLOTS] = {
+    aimdo_adapter_alloc_0,
+    aimdo_adapter_alloc_1,
+};
+static const PFN_urUSMFree kAdapterFreeThunks[MAX_UR_ADAPTER_SLOTS] = {
+    aimdo_adapter_free_0,
+    aimdo_adapter_free_1,
+};
+static const PFN_urPhysicalMemCreate
+    kAdapterPhysCreateThunks[MAX_UR_ADAPTER_SLOTS] = {
+        aimdo_adapter_phys_create_0,
+        aimdo_adapter_phys_create_1,
+};
+
+static bool query_adapter_ddi_table(HMODULE adapter, const char *export_name,
+                                    void *table_out, size_t table_size) {
+    static const uint32_t kVersions[] = {
+        AIMDO_UR_API_VERSION_0_12,
+        AIMDO_UR_API_VERSION_0_11,
+        AIMDO_UR_API_VERSION_0_10,
+        AIMDO_UR_API_VERSION_0_9,
+    };
+    PFN_urGetProcAddrTable getter =
+        (PFN_urGetProcAddrTable)(void *)GetProcAddress(adapter, export_name);
+    size_t i;
+
+    if (!getter) {
+        return false;
+    }
+    for (i = 0; i < ARRAYSIZE(kVersions); ++i) {
+        memset(table_out, 0, table_size);
+        if (getter(kVersions[i], table_out) == UR_RESULT_SUCCESS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool attach_adapter_slot(int slot_index, const wchar_t *dll_name) {
+    HMODULE adapter = GetModuleHandleW(dll_name);
+    struct AimdoUrUsmDdiTable usm_tbl;
+    struct AimdoUrDeviceDdiTable dev_tbl;
+    struct AimdoUrPhysicalMemDdiTable phys_tbl;
+    struct UrAdapterHookSlot *slot = &g_adapter_slots[slot_index];
+    LONG status;
+
+    if (!adapter) {
+        adapter = find_module_by_name(dll_name);
+    }
+    if (!adapter) {
+        return false;
+    }
+    if (!query_adapter_ddi_table(adapter, "urGetUSMProcAddrTable", &usm_tbl,
+                                 sizeof(usm_tbl)) ||
+        !query_adapter_ddi_table(adapter, "urGetDeviceProcAddrTable", &dev_tbl,
+                                 sizeof(dev_tbl)) ||
+        !usm_tbl.pfnDeviceAlloc || !usm_tbl.pfnFree ||
+        !dev_tbl.pfnGetNativeHandle) {
+        return false;
+    }
+
+    slot->true_alloc = usm_tbl.pfnDeviceAlloc;
+    slot->true_free = usm_tbl.pfnFree;
+    slot->get_native_handle = dev_tbl.pfnGetNativeHandle;
+    slot->true_phys_create = NULL;
+    if (query_adapter_ddi_table(adapter, "urGetPhysicalMemProcAddrTable",
+                                &phys_tbl, sizeof(phys_tbl))) {
+        slot->true_phys_create = phys_tbl.pfnCreate;
+    }
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    status = DetourAttach((void **)&slot->true_alloc,
+                          kAdapterAllocThunks[slot_index]);
+    if (status == NO_ERROR) {
+        status = DetourAttach((void **)&slot->true_free,
+                              kAdapterFreeThunks[slot_index]);
+    }
+    if (status == NO_ERROR && slot->true_phys_create) {
+        status = DetourAttach((void **)&slot->true_phys_create,
+                              kAdapterPhysCreateThunks[slot_index]);
+    }
+    if (status != NO_ERROR) {
+        DetourTransactionAbort();
+        memset(slot, 0, sizeof(*slot));
+        aimdo_log(kAimdoUrLogWarning, __FILE__, __LINE__,
+                  "%s: DetourAttach failed for %ls: %ld\n", __func__, dll_name,
+                  (long)status);
+        return false;
+    }
+    status = DetourTransactionCommit();
+    if (status != NO_ERROR) {
+        memset(slot, 0, sizeof(*slot));
+        aimdo_log(kAimdoUrLogWarning, __FILE__, __LINE__,
+                  "%s: DetourTransactionCommit failed for %ls: %ld\n", __func__,
+                  dll_name, (long)status);
+        return false;
+    }
+    slot->attached = true;
+    return true;
+}
+
+static void detach_adapter_slots(void) {
+    int i;
+
+    for (i = 0; i < MAX_UR_ADAPTER_SLOTS; ++i) {
+        struct UrAdapterHookSlot *slot = &g_adapter_slots[i];
+        LONG status;
+
+        if (!slot->attached) {
+            continue;
+        }
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourDetach((void **)&slot->true_alloc, kAdapterAllocThunks[i]);
+        DetourDetach((void **)&slot->true_free, kAdapterFreeThunks[i]);
+        if (slot->true_phys_create) {
+            DetourDetach((void **)&slot->true_phys_create,
+                         kAdapterPhysCreateThunks[i]);
+        }
+        status = DetourTransactionCommit();
+        if (status == NO_ERROR) {
+            memset(slot, 0, sizeof(*slot));
+        } else {
+            aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
+                      "%s: DetourDetach failed for adapter slot %d: %ld\n",
+                      __func__, i, (long)status);
+        }
+    }
 }
 
 
@@ -796,11 +1075,39 @@ void *aimdo_xpu_ur_loader(void) {
     return (void *)resolve_ur_loader();
 }
 
+static int attach_missing_adapter_slots(void) {
+    int attached = 0;
+
+    if (!g_adapter_slots[0].attached) {
+        attach_adapter_slot(0, L"ur_adapter_level_zero.dll");
+    }
+    if (!g_adapter_slots[1].attached) {
+        attach_adapter_slot(1, L"ur_adapter_level_zero_v2.dll");
+    }
+    if (g_adapter_slots[0].attached) {
+        ++attached;
+    }
+    if (g_adapter_slots[1].attached) {
+        ++attached;
+    }
+    return attached;
+}
+
 bool aimdo_xpu_ur_hook_install(void) {
     HMODULE loader;
     LONG status;
+    bool loader_attached = false;
+    int adapter_attached_count = 0;
 
     if (InterlockedCompareExchange(&g_attached, 0, 0)) {
+        /* If control.init() ran before torch/sycl9 loaded the Level Zero
+         * adapters, pick up any newly loaded adapter DLLs on subsequent
+         * calls (such as xpu_ur_hook_enable() inside control.init_devices()). */
+        if (InterlockedCompareExchange(&g_lock_ready, 0, 0)) {
+            EnterCriticalSection(&g_hook_lock);
+            attach_missing_adapter_slots();
+            LeaveCriticalSection(&g_hook_lock);
+        }
         return true;
     }
     /* Checked here rather than only at the ze-detour call site: control.py
@@ -816,60 +1123,72 @@ bool aimdo_xpu_ur_hook_install(void) {
     }
 
     loader = resolve_ur_loader();
-    if (!loader) {
-        aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
-                  "%s: ur_loader.dll is not loaded; import torch before "
-                  "initializing AIMDO\n", __func__);
-        return false;
+    if (loader) {
+        true_urUSMDeviceAlloc =
+            (PFN_urUSMDeviceAlloc)(void *)GetProcAddress(loader, "urUSMDeviceAlloc");
+        true_urUSMFree = (PFN_urUSMFree)(void *)GetProcAddress(loader, "urUSMFree");
+        true_urPhysicalMemCreate = (PFN_urPhysicalMemCreate)(void *)GetProcAddress(
+            loader, "urPhysicalMemCreate");
+        real_urDeviceGetNativeHandle =
+            (PFN_urDeviceGetNativeHandle)(void *)GetProcAddress(
+                loader, "urDeviceGetNativeHandle");
+        if (true_urUSMDeviceAlloc && true_urUSMFree &&
+            real_urDeviceGetNativeHandle) {
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            status = DetourAttach((void **)&true_urUSMDeviceAlloc,
+                                  aimdo_urUSMDeviceAlloc);
+            if (status == NO_ERROR) {
+                status = DetourAttach((void **)&true_urUSMFree, aimdo_urUSMFree);
+            }
+            if (status == NO_ERROR && true_urPhysicalMemCreate) {
+                status = DetourAttach((void **)&true_urPhysicalMemCreate,
+                                      aimdo_urPhysicalMemCreate);
+            }
+            if (status != NO_ERROR) {
+                DetourTransactionAbort();
+                aimdo_log(kAimdoUrLogWarning, __FILE__, __LINE__,
+                          "%s: DetourAttach on ur_loader failed: %ld\n",
+                          __func__, (long)status);
+                true_urUSMDeviceAlloc = NULL;
+                true_urUSMFree = NULL;
+                true_urPhysicalMemCreate = NULL;
+            } else {
+                status = DetourTransactionCommit();
+                if (status != NO_ERROR) {
+                    aimdo_log(kAimdoUrLogWarning, __FILE__, __LINE__,
+                              "%s: DetourTransactionCommit on ur_loader failed: %ld\n",
+                              __func__, (long)status);
+                    true_urUSMDeviceAlloc = NULL;
+                    true_urUSMFree = NULL;
+                    true_urPhysicalMemCreate = NULL;
+                } else {
+                    loader_attached = true;
+                }
+            }
+        }
     }
 
-    true_urUSMDeviceAlloc =
-        (PFN_urUSMDeviceAlloc)(void *)GetProcAddress(loader, "urUSMDeviceAlloc");
-    true_urUSMFree = (PFN_urUSMFree)(void *)GetProcAddress(loader, "urUSMFree");
-    true_urPhysicalMemCreate = (PFN_urPhysicalMemCreate)(void *)GetProcAddress(
-        loader, "urPhysicalMemCreate");
-    real_urDeviceGetNativeHandle =
-        (PFN_urDeviceGetNativeHandle)(void *)GetProcAddress(
-            loader, "urDeviceGetNativeHandle");
-    if (!true_urUSMDeviceAlloc || !true_urUSMFree ||
-        !real_urDeviceGetNativeHandle) {
+    /* Intel oneAPI 2026.2+ (sycl9.dll) statically links the UR loader and
+     * dispatches straight into ur_adapter_level_zero[_v2].dll's DDI tables,
+     * bypassing ur_loader.dll entirely. Attach to the loaded Level Zero
+     * adapters as well; t_ur_hook_depth ensures older sycl8.dll stacks that
+     * enter via ur_loader.dll do not double-arbitrate when forwarding down. */
+    adapter_attached_count = attach_missing_adapter_slots();
+
+    if (!loader_attached && adapter_attached_count == 0) {
         aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
-                  "%s: Unified Runtime USM entry points were not found\n",
+                  "%s: neither ur_loader.dll nor ur_adapter_level_zero.dll "
+                  "could be hooked; import torch before initializing AIMDO\n",
                   __func__);
-        return false;
-    }
-
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    status = DetourAttach((void **)&true_urUSMDeviceAlloc, aimdo_urUSMDeviceAlloc);
-    if (status == NO_ERROR) {
-        status = DetourAttach((void **)&true_urUSMFree, aimdo_urUSMFree);
-    }
-    if (status == NO_ERROR && true_urPhysicalMemCreate) {
-        status = DetourAttach((void **)&true_urPhysicalMemCreate,
-                              aimdo_urPhysicalMemCreate);
-    }
-    if (status != NO_ERROR) {
-        DetourTransactionAbort();
-        aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
-                  "%s: DetourAttach failed: %ld\n", __func__, (long)status);
-        true_urUSMDeviceAlloc = NULL;
-        true_urUSMFree = NULL;
-        true_urPhysicalMemCreate = NULL;
-        return false;
-    }
-    status = DetourTransactionCommit();
-    if (status != NO_ERROR) {
-        aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
-                  "%s: DetourTransactionCommit failed: %ld\n", __func__,
-                  (long)status);
         return false;
     }
 
     InterlockedExchange(&g_attached, 1);
     aimdo_log(kAimdoUrLogInfo, __FILE__, __LINE__,
-              "%s: arbitrating Unified Runtime USM allocations; PyTorch "
-              "caching allocator retained\n", __func__);
+              "%s: arbitrating Unified Runtime USM allocations "
+              "(ur_loader=%s, l0_adapters=%d); PyTorch caching allocator retained\n",
+              __func__, loader_attached ? "yes" : "no", adapter_attached_count);
     return true;
 }
 
@@ -880,26 +1199,29 @@ void aimdo_xpu_ur_hook_remove(void) {
         return;
     }
     InterlockedExchange(&g_enabled, 0);
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    DetourDetach((void **)&true_urUSMDeviceAlloc, aimdo_urUSMDeviceAlloc);
-    DetourDetach((void **)&true_urUSMFree, aimdo_urUSMFree);
-    if (true_urPhysicalMemCreate) {
-        DetourDetach((void **)&true_urPhysicalMemCreate,
-                     aimdo_urPhysicalMemCreate);
+    detach_adapter_slots();
+    if (true_urUSMDeviceAlloc && true_urUSMFree) {
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourDetach((void **)&true_urUSMDeviceAlloc, aimdo_urUSMDeviceAlloc);
+        DetourDetach((void **)&true_urUSMFree, aimdo_urUSMFree);
+        if (true_urPhysicalMemCreate) {
+            DetourDetach((void **)&true_urPhysicalMemCreate,
+                         aimdo_urPhysicalMemCreate);
+        }
+        status = DetourTransactionCommit();
+        if (status != NO_ERROR) {
+            /* The hooks are still live; keeping the trampolines is the only way
+             * they can still reach the real entry points. */
+            aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
+                      "%s: DetourDetach failed: %ld; hooks remain installed\n",
+                      __func__, (long)status);
+            return;
+        }
+        true_urUSMDeviceAlloc = NULL;
+        true_urUSMFree = NULL;
+        true_urPhysicalMemCreate = NULL;
     }
-    status = DetourTransactionCommit();
-    if (status != NO_ERROR) {
-        /* The hooks are still live; keeping the trampolines is the only way
-         * they can still reach the real entry points. */
-        aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
-                  "%s: DetourDetach failed: %ld; hooks remain installed\n",
-                  __func__, (long)status);
-        return;
-    }
-    true_urUSMDeviceAlloc = NULL;
-    true_urUSMFree = NULL;
-    true_urPhysicalMemCreate = NULL;
     InterlockedExchange(&g_attached, 0);
 }
 
@@ -908,9 +1230,6 @@ void aimdo_xpu_ur_hook_remove(void) {
  * platforms through one interface. On Linux "interposed" means the dynamic
  * linker bound the symbol to AIMDO; here it means Detours patched it. */
 __declspec(dllexport) bool xpu_ur_hook_is_interposed(void) {
-    if (InterlockedCompareExchange(&g_attached, 0, 0)) {
-        return true;
-    }
     return aimdo_xpu_ur_hook_install();
 }
 
