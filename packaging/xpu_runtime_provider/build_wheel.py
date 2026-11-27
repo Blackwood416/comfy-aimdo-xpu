@@ -281,7 +281,7 @@ def _manifest(
             "name": CANONICAL_DISTRIBUTION,
             "compatible_versions": sorted(set(
                 (compiler_api["canonical_versions"] if compiler_api else [source_version])
-                + ["0.5.5", "0.5.6", "0.6.0"]
+                + [source_version.split("+", 1)[0], "0.5.5", "0.5.6", "0.6.0", "0.6.1"]
             )),
         },
         "canonical_import": CANONICAL_PACKAGE,
