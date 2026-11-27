@@ -446,7 +446,14 @@ class ModelVBAR:
             # native stats with AIMDO VBAR/hook state.  Never take this
             # snapshot from the allocation hook, where Python or allocator
             # re-entry would violate native ownership.
-            cache_released = _release_native_cache(self.device)
+            # Linux does not reopen ranges already excluded by the watermark.
+            # Releasing Torch's reusable buffers cannot make such a request
+            # eligible: recovery restores only the pre-fault watermark below.
+            # Keep the cache for its consumers instead of flushing it for an
+            # expected host-streaming miss. Admitted ranges retain recovery.
+            excluded = (native_watermark is not None and
+                        offset + size > native_watermark * (32 * 1024 ** 2))
+            cache_released = not excluded and _release_native_cache(self.device)
             # Sync the compute queue so pending retire fences from previously
             # unpinned blocks complete; their VBAR pages then become eligible
             # for the non-blocking reclaim inside the retried fault.  This is a
@@ -455,12 +462,6 @@ class ModelVBAR:
             if sys.platform == "win32" and control.implementation == "xpu":
                 import torch
                 torch.xpu.synchronize(self.device)
-            else:
-                try:
-                    import torch
-                    torch.xpu.synchronize(self.device)
-                except Exception:
-                    pass
             if cache_released:
                 if native_watermark is not None:
                     # The first Linux fault may lower the watermark before
