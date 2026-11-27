@@ -70,12 +70,18 @@ class MallocGraph:
                        else int(stream.cuda_stream))
             self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
             self._stream = stream
+            prev_pointer = (int(previous.sycl_queue) if control.implementation == "xpu"
+                            else int(previous.cuda_stream))
             try:
                 yield
-            finally:
-                pointer = (int(previous.sycl_queue) if control.implementation == "xpu"
-                           else int(previous.cuda_stream))
-                self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
+            except BaseException:
+                if self._handle and control.lib.malloc_graph_set_stream(
+                    self._handle, ctypes.c_void_p(prev_pointer)
+                ):
+                    self._stream = previous
+                raise
+            else:
+                self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(prev_pointer))
                 self._stream = previous
 
     def iterate(self, name=None):
